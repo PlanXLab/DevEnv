@@ -1,0 +1,525 @@
+namespace VSCodePortableInstaller
+{
+    partial class InstallForm
+    {
+        private System.ComponentModel.IContainer components = null;
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && (components != null))
+            {
+                components.Dispose();
+            }
+
+            if (elapsedTimer != null)
+            {
+                elapsedTimer.Stop();
+                elapsedTimer.Dispose();
+                elapsedTimer = null;
+            }
+
+            base.Dispose(disposing);
+        }
+
+        #region Windows Form Designer generated code
+
+        private void InitializeComponent()
+        {
+            this.headerPanel = new System.Windows.Forms.Panel();
+            this.headerTitleLabel = new System.Windows.Forms.Label();
+            this.headerSubLabel = new System.Windows.Forms.Label();
+            this.settingsPanel = new System.Windows.Forms.Panel();
+            this.pathLabel = new System.Windows.Forms.Label();
+            this.installPathTextBox = new System.Windows.Forms.TextBox();
+            this.browseButton = new System.Windows.Forms.Button();
+            this.pythonLabel = new System.Windows.Forms.Label();
+            this.pythonVersionTextBox = new System.Windows.Forms.TextBox();
+            this.pythonHint = new System.Windows.Forms.Label();
+            this.installButton = new System.Windows.Forms.Button();
+            this.cancelButton = new System.Windows.Forms.Button();
+            this.label1 = new System.Windows.Forms.Label();
+            this.separatorPanel = new System.Windows.Forms.Panel();
+            this.progressPanel = new System.Windows.Forms.Panel();
+            this.componentTable = new System.Windows.Forms.TableLayoutPanel();
+            this.fontsNameLabel = new System.Windows.Forms.Label();
+            this.fontsProgressBar = new System.Windows.Forms.ProgressBar();
+            this.fontsStatusLabel = new System.Windows.Forms.Label();
+            this.pwshNameLabel = new System.Windows.Forms.Label();
+            this.pwshProgressBar = new System.Windows.Forms.ProgressBar();
+            this.pwshStatusLabel = new System.Windows.Forms.Label();
+            this.vscodeNameLabel = new System.Windows.Forms.Label();
+            this.vscodeProgressBar = new System.Windows.Forms.ProgressBar();
+            this.vscodeStatusLabel = new System.Windows.Forms.Label();
+            this.pythonNameLabel = new System.Windows.Forms.Label();
+            this.pythonProgressBar = new System.Windows.Forms.ProgressBar();
+            this.pythonStatusLabel = new System.Windows.Forms.Label();
+            this.overallProgress = new System.Windows.Forms.ProgressBar();
+            this.completedLabel = new System.Windows.Forms.Label();
+            this.elapsedTimeLabel = new System.Windows.Forms.Label();
+            this.currentTaskLabel = new System.Windows.Forms.Label();
+            this.logHeaderLabel = new System.Windows.Forms.Label();
+            this.activityLog = new System.Windows.Forms.TextBox();
+            this.headerPanel.SuspendLayout();
+            this.settingsPanel.SuspendLayout();
+            this.progressPanel.SuspendLayout();
+            this.componentTable.SuspendLayout();
+            this.SuspendLayout();
+            //
+            // headerPanel
+            //
+            this.headerPanel.BackColor = System.Drawing.Color.FromArgb(0, 88, 160);
+            this.headerPanel.Controls.Add(this.headerSubLabel);
+            this.headerPanel.Controls.Add(this.headerTitleLabel);
+            this.headerPanel.Location = new System.Drawing.Point(0, 0);
+            this.headerPanel.Name = "headerPanel";
+            this.headerPanel.Size = new System.Drawing.Size(720, 64);
+            this.headerPanel.TabIndex = 0;
+            //
+            // headerTitleLabel
+            //
+            this.headerTitleLabel.AutoSize = true;
+            this.headerTitleLabel.Font = new System.Drawing.Font("Segoe UI", 14F, System.Drawing.FontStyle.Bold);
+            this.headerTitleLabel.ForeColor = System.Drawing.Color.White;
+            this.headerTitleLabel.Location = new System.Drawing.Point(20, 10);
+            this.headerTitleLabel.Name = "headerTitleLabel";
+            this.headerTitleLabel.Text = "DevEnv Setup";
+            //
+            // headerSubLabel
+            //
+            this.headerSubLabel.AutoSize = true;
+            this.headerSubLabel.Font = new System.Drawing.Font("Segoe UI", 8.5F);
+            this.headerSubLabel.ForeColor = System.Drawing.Color.FromArgb(176, 210, 240);
+            this.headerSubLabel.Location = new System.Drawing.Point(22, 38);
+            this.headerSubLabel.Name = "headerSubLabel";
+            this.headerSubLabel.Text = "Portable Development Environment Installer";
+            //
+            // settingsPanel
+            //
+            this.settingsPanel.BackColor = System.Drawing.Color.FromArgb(249, 249, 249);
+            this.settingsPanel.Controls.Add(this.label1);
+            this.settingsPanel.Controls.Add(this.cancelButton);
+            this.settingsPanel.Controls.Add(this.installButton);
+            this.settingsPanel.Controls.Add(this.pythonHint);
+            this.settingsPanel.Controls.Add(this.pythonVersionTextBox);
+            this.settingsPanel.Controls.Add(this.pythonLabel);
+            this.settingsPanel.Controls.Add(this.browseButton);
+            this.settingsPanel.Controls.Add(this.installPathTextBox);
+            this.settingsPanel.Controls.Add(this.pathLabel);
+            this.settingsPanel.Location = new System.Drawing.Point(0, 64);
+            this.settingsPanel.Name = "settingsPanel";
+            this.settingsPanel.Size = new System.Drawing.Size(720, 120);
+            this.settingsPanel.TabIndex = 1;
+            //
+            // pathLabel
+            //
+            this.pathLabel.Font = new System.Drawing.Font("Segoe UI", 9F);
+            this.pathLabel.ForeColor = System.Drawing.Color.FromArgb(50, 50, 50);
+            this.pathLabel.Location = new System.Drawing.Point(24, 14);
+            this.pathLabel.Name = "pathLabel";
+            this.pathLabel.Size = new System.Drawing.Size(100, 22);
+            this.pathLabel.Text = "Installation Path";
+            this.pathLabel.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
+            //
+            // installPathTextBox
+            //
+            this.installPathTextBox.BorderStyle = System.Windows.Forms.BorderStyle.FixedSingle;
+            this.installPathTextBox.Font = new System.Drawing.Font("Segoe UI", 9F);
+            this.installPathTextBox.Location = new System.Drawing.Point(128, 12);
+            this.installPathTextBox.Name = "installPathTextBox";
+            this.installPathTextBox.Size = new System.Drawing.Size(460, 23);
+            this.installPathTextBox.Text = "C:\\VSCode";
+            //
+            // browseButton
+            //
+            this.browseButton.BackColor = System.Drawing.Color.White;
+            this.browseButton.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.browseButton.FlatAppearance.BorderColor = System.Drawing.Color.FromArgb(200, 200, 200);
+            this.browseButton.FlatAppearance.MouseOverBackColor = System.Drawing.Color.FromArgb(240, 240, 240);
+            this.browseButton.FlatAppearance.MouseDownBackColor = System.Drawing.Color.FromArgb(225, 225, 225);
+            this.browseButton.Font = new System.Drawing.Font("Segoe UI", 8.5F);
+            this.browseButton.ForeColor = System.Drawing.Color.FromArgb(50, 50, 50);
+            this.browseButton.Location = new System.Drawing.Point(594, 10);
+            this.browseButton.Name = "browseButton";
+            this.browseButton.Size = new System.Drawing.Size(100, 27);
+            this.browseButton.Text = "Browse...";
+            this.browseButton.UseVisualStyleBackColor = false;
+            this.browseButton.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.browseButton.Click += new System.EventHandler(this.BrowseButton_Click);
+            //
+            // pythonLabel
+            //
+            this.pythonLabel.Font = new System.Drawing.Font("Segoe UI", 9F);
+            this.pythonLabel.ForeColor = System.Drawing.Color.FromArgb(50, 50, 50);
+            this.pythonLabel.Location = new System.Drawing.Point(24, 48);
+            this.pythonLabel.Name = "pythonLabel";
+            this.pythonLabel.Size = new System.Drawing.Size(100, 22);
+            this.pythonLabel.Text = "Python Version";
+            this.pythonLabel.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
+            //
+            // pythonVersionTextBox
+            //
+            this.pythonVersionTextBox.BorderStyle = System.Windows.Forms.BorderStyle.FixedSingle;
+            this.pythonVersionTextBox.Font = new System.Drawing.Font("Segoe UI", 9F);
+            this.pythonVersionTextBox.Location = new System.Drawing.Point(128, 46);
+            this.pythonVersionTextBox.Name = "pythonVersionTextBox";
+            this.pythonVersionTextBox.Size = new System.Drawing.Size(150, 23);
+            //
+            // pythonHint
+            //
+            this.pythonHint.Font = new System.Drawing.Font("Segoe UI", 8F);
+            this.pythonHint.ForeColor = System.Drawing.Color.FromArgb(150, 150, 150);
+            this.pythonHint.Location = new System.Drawing.Point(284, 49);
+            this.pythonHint.Name = "pythonHint";
+            this.pythonHint.Size = new System.Drawing.Size(200, 18);
+            this.pythonHint.Text = "(e.g. 3.12  or leave empty for latest)";
+            this.pythonHint.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
+            //
+            // label1
+            //
+            this.label1.Font = new System.Drawing.Font("Segoe UI", 8F);
+            this.label1.ForeColor = System.Drawing.Color.FromArgb(130, 170, 210);
+            this.label1.Location = new System.Drawing.Point(24, 86);
+            this.label1.Name = "label1";
+            this.label1.Size = new System.Drawing.Size(140, 20);
+            this.label1.Text = "PlanX Lab \u00b7 Atticle";
+            this.label1.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
+            //
+            // installButton
+            //
+            this.installButton.BackColor = System.Drawing.Color.FromArgb(0, 120, 212);
+            this.installButton.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.installButton.FlatAppearance.BorderSize = 0;
+            this.installButton.FlatAppearance.MouseOverBackColor = System.Drawing.Color.FromArgb(16, 110, 190);
+            this.installButton.FlatAppearance.MouseDownBackColor = System.Drawing.Color.FromArgb(0, 90, 158);
+            this.installButton.Font = new System.Drawing.Font("Segoe UI", 9.5F, System.Drawing.FontStyle.Bold);
+            this.installButton.ForeColor = System.Drawing.Color.White;
+            this.installButton.Location = new System.Drawing.Point(478, 80);
+            this.installButton.Name = "installButton";
+            this.installButton.Size = new System.Drawing.Size(110, 34);
+            this.installButton.Text = "Install";
+            this.installButton.UseVisualStyleBackColor = false;
+            this.installButton.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.installButton.Click += new System.EventHandler(this.InstallButton_Click);
+            //
+            // cancelButton
+            //
+            this.cancelButton.BackColor = System.Drawing.Color.White;
+            this.cancelButton.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.cancelButton.FlatAppearance.BorderColor = System.Drawing.Color.FromArgb(210, 210, 210);
+            this.cancelButton.FlatAppearance.MouseOverBackColor = System.Drawing.Color.FromArgb(240, 240, 240);
+            this.cancelButton.FlatAppearance.MouseDownBackColor = System.Drawing.Color.FromArgb(225, 225, 225);
+            this.cancelButton.Font = new System.Drawing.Font("Segoe UI", 9F);
+            this.cancelButton.ForeColor = System.Drawing.Color.FromArgb(50, 50, 50);
+            this.cancelButton.Location = new System.Drawing.Point(594, 80);
+            this.cancelButton.Name = "cancelButton";
+            this.cancelButton.Size = new System.Drawing.Size(100, 34);
+            this.cancelButton.Text = "Cancel";
+            this.cancelButton.UseVisualStyleBackColor = false;
+            this.cancelButton.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.cancelButton.Click += new System.EventHandler(this.CancelButton_Click);
+            //
+            // separatorPanel
+            //
+            this.separatorPanel.BackColor = System.Drawing.Color.FromArgb(228, 228, 228);
+            this.separatorPanel.Location = new System.Drawing.Point(0, 184);
+            this.separatorPanel.Name = "separatorPanel";
+            this.separatorPanel.Size = new System.Drawing.Size(720, 1);
+            this.separatorPanel.TabIndex = 2;
+            //
+            // progressPanel
+            //
+            this.progressPanel.BackColor = System.Drawing.Color.White;
+            this.progressPanel.Controls.Add(this.componentTable);
+            this.progressPanel.Controls.Add(this.overallProgress);
+            this.progressPanel.Controls.Add(this.completedLabel);
+            this.progressPanel.Controls.Add(this.elapsedTimeLabel);
+            this.progressPanel.Controls.Add(this.currentTaskLabel);
+            this.progressPanel.Controls.Add(this.logHeaderLabel);
+            this.progressPanel.Controls.Add(this.activityLog);
+            this.progressPanel.Location = new System.Drawing.Point(0, 185);
+            this.progressPanel.Name = "progressPanel";
+            this.progressPanel.Size = new System.Drawing.Size(720, 345);
+            this.progressPanel.TabIndex = 3;
+            //
+            // componentTable
+            //
+            this.componentTable.ColumnCount = 3;
+            this.componentTable.ColumnStyles.Add(new System.Windows.Forms.ColumnStyle(System.Windows.Forms.SizeType.Absolute, 96F));
+            this.componentTable.ColumnStyles.Add(new System.Windows.Forms.ColumnStyle(System.Windows.Forms.SizeType.Percent, 100F));
+            this.componentTable.ColumnStyles.Add(new System.Windows.Forms.ColumnStyle(System.Windows.Forms.SizeType.Absolute, 110F));
+            this.componentTable.Controls.Add(this.fontsNameLabel, 0, 0);
+            this.componentTable.Controls.Add(this.fontsProgressBar, 1, 0);
+            this.componentTable.Controls.Add(this.fontsStatusLabel, 2, 0);
+            this.componentTable.Controls.Add(this.pwshNameLabel, 0, 1);
+            this.componentTable.Controls.Add(this.pwshProgressBar, 1, 1);
+            this.componentTable.Controls.Add(this.pwshStatusLabel, 2, 1);
+            this.componentTable.Controls.Add(this.vscodeNameLabel, 0, 2);
+            this.componentTable.Controls.Add(this.vscodeProgressBar, 1, 2);
+            this.componentTable.Controls.Add(this.vscodeStatusLabel, 2, 2);
+            this.componentTable.Controls.Add(this.pythonNameLabel, 0, 3);
+            this.componentTable.Controls.Add(this.pythonProgressBar, 1, 3);
+            this.componentTable.Controls.Add(this.pythonStatusLabel, 2, 3);
+            this.componentTable.Location = new System.Drawing.Point(20, 14);
+            this.componentTable.Name = "componentTable";
+            this.componentTable.RowCount = 4;
+            this.componentTable.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.Percent, 25F));
+            this.componentTable.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.Percent, 25F));
+            this.componentTable.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.Percent, 25F));
+            this.componentTable.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.Percent, 25F));
+            this.componentTable.Size = new System.Drawing.Size(680, 148);
+            this.componentTable.TabIndex = 0;
+            //
+            // fontsNameLabel
+            //
+            this.fontsNameLabel.AutoSize = false;
+            this.fontsNameLabel.Anchor = System.Windows.Forms.AnchorStyles.Left;
+            this.fontsNameLabel.Font = new System.Drawing.Font("Segoe UI", 9F);
+            this.fontsNameLabel.ForeColor = System.Drawing.Color.FromArgb(50, 50, 50);
+            this.fontsNameLabel.Location = new System.Drawing.Point(3, 0);
+            this.fontsNameLabel.Name = "fontsNameLabel";
+            this.fontsNameLabel.Size = new System.Drawing.Size(90, 37);
+            this.fontsNameLabel.Text = "Fonts";
+            this.fontsNameLabel.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
+            //
+            // fontsProgressBar
+            //
+            this.fontsProgressBar.Anchor = ((System.Windows.Forms.AnchorStyles)((System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right)));
+            this.fontsProgressBar.Location = new System.Drawing.Point(99, 12);
+            this.fontsProgressBar.Name = "fontsProgressBar";
+            this.fontsProgressBar.Size = new System.Drawing.Size(468, 12);
+            this.fontsProgressBar.Style = System.Windows.Forms.ProgressBarStyle.Continuous;
+            //
+            // fontsStatusLabel
+            //
+            this.fontsStatusLabel.AutoSize = false;
+            this.fontsStatusLabel.Anchor = System.Windows.Forms.AnchorStyles.Right;
+            this.fontsStatusLabel.Font = new System.Drawing.Font("Segoe UI", 8.5F);
+            this.fontsStatusLabel.ForeColor = System.Drawing.Color.FromArgb(160, 160, 160);
+            this.fontsStatusLabel.Location = new System.Drawing.Point(573, 0);
+            this.fontsStatusLabel.Name = "fontsStatusLabel";
+            this.fontsStatusLabel.Size = new System.Drawing.Size(104, 37);
+            this.fontsStatusLabel.Text = "Waiting";
+            this.fontsStatusLabel.TextAlign = System.Drawing.ContentAlignment.MiddleRight;
+            //
+            // pwshNameLabel
+            //
+            this.pwshNameLabel.AutoSize = false;
+            this.pwshNameLabel.Anchor = System.Windows.Forms.AnchorStyles.Left;
+            this.pwshNameLabel.Font = new System.Drawing.Font("Segoe UI", 9F);
+            this.pwshNameLabel.ForeColor = System.Drawing.Color.FromArgb(50, 50, 50);
+            this.pwshNameLabel.Location = new System.Drawing.Point(3, 37);
+            this.pwshNameLabel.Name = "pwshNameLabel";
+            this.pwshNameLabel.Size = new System.Drawing.Size(90, 37);
+            this.pwshNameLabel.Text = "PowerShell 7";
+            this.pwshNameLabel.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
+            //
+            // pwshProgressBar
+            //
+            this.pwshProgressBar.Anchor = ((System.Windows.Forms.AnchorStyles)((System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right)));
+            this.pwshProgressBar.Location = new System.Drawing.Point(99, 49);
+            this.pwshProgressBar.Name = "pwshProgressBar";
+            this.pwshProgressBar.Size = new System.Drawing.Size(468, 12);
+            this.pwshProgressBar.Style = System.Windows.Forms.ProgressBarStyle.Continuous;
+            //
+            // pwshStatusLabel
+            //
+            this.pwshStatusLabel.AutoSize = false;
+            this.pwshStatusLabel.Anchor = System.Windows.Forms.AnchorStyles.Right;
+            this.pwshStatusLabel.Font = new System.Drawing.Font("Segoe UI", 8.5F);
+            this.pwshStatusLabel.ForeColor = System.Drawing.Color.FromArgb(160, 160, 160);
+            this.pwshStatusLabel.Location = new System.Drawing.Point(573, 37);
+            this.pwshStatusLabel.Name = "pwshStatusLabel";
+            this.pwshStatusLabel.Size = new System.Drawing.Size(104, 37);
+            this.pwshStatusLabel.Text = "Waiting";
+            this.pwshStatusLabel.TextAlign = System.Drawing.ContentAlignment.MiddleRight;
+            //
+            // vscodeNameLabel
+            //
+            this.vscodeNameLabel.AutoSize = false;
+            this.vscodeNameLabel.Anchor = System.Windows.Forms.AnchorStyles.Left;
+            this.vscodeNameLabel.Font = new System.Drawing.Font("Segoe UI", 9F);
+            this.vscodeNameLabel.ForeColor = System.Drawing.Color.FromArgb(50, 50, 50);
+            this.vscodeNameLabel.Location = new System.Drawing.Point(3, 74);
+            this.vscodeNameLabel.Name = "vscodeNameLabel";
+            this.vscodeNameLabel.Size = new System.Drawing.Size(90, 37);
+            this.vscodeNameLabel.Text = "VS Code";
+            this.vscodeNameLabel.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
+            //
+            // vscodeProgressBar
+            //
+            this.vscodeProgressBar.Anchor = ((System.Windows.Forms.AnchorStyles)((System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right)));
+            this.vscodeProgressBar.Location = new System.Drawing.Point(99, 86);
+            this.vscodeProgressBar.Name = "vscodeProgressBar";
+            this.vscodeProgressBar.Size = new System.Drawing.Size(468, 12);
+            this.vscodeProgressBar.Style = System.Windows.Forms.ProgressBarStyle.Continuous;
+            //
+            // vscodeStatusLabel
+            //
+            this.vscodeStatusLabel.AutoSize = false;
+            this.vscodeStatusLabel.Anchor = System.Windows.Forms.AnchorStyles.Right;
+            this.vscodeStatusLabel.Font = new System.Drawing.Font("Segoe UI", 8.5F);
+            this.vscodeStatusLabel.ForeColor = System.Drawing.Color.FromArgb(160, 160, 160);
+            this.vscodeStatusLabel.Location = new System.Drawing.Point(573, 74);
+            this.vscodeStatusLabel.Name = "vscodeStatusLabel";
+            this.vscodeStatusLabel.Size = new System.Drawing.Size(104, 37);
+            this.vscodeStatusLabel.Text = "Waiting";
+            this.vscodeStatusLabel.TextAlign = System.Drawing.ContentAlignment.MiddleRight;
+            //
+            // pythonNameLabel
+            //
+            this.pythonNameLabel.AutoSize = false;
+            this.pythonNameLabel.Anchor = System.Windows.Forms.AnchorStyles.Left;
+            this.pythonNameLabel.Font = new System.Drawing.Font("Segoe UI", 9F);
+            this.pythonNameLabel.ForeColor = System.Drawing.Color.FromArgb(50, 50, 50);
+            this.pythonNameLabel.Location = new System.Drawing.Point(3, 111);
+            this.pythonNameLabel.Name = "pythonNameLabel";
+            this.pythonNameLabel.Size = new System.Drawing.Size(90, 37);
+            this.pythonNameLabel.Text = "Python";
+            this.pythonNameLabel.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
+            //
+            // pythonProgressBar
+            //
+            this.pythonProgressBar.Anchor = ((System.Windows.Forms.AnchorStyles)((System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right)));
+            this.pythonProgressBar.Location = new System.Drawing.Point(99, 123);
+            this.pythonProgressBar.Name = "pythonProgressBar";
+            this.pythonProgressBar.Size = new System.Drawing.Size(468, 12);
+            this.pythonProgressBar.Style = System.Windows.Forms.ProgressBarStyle.Continuous;
+            //
+            // pythonStatusLabel
+            //
+            this.pythonStatusLabel.AutoSize = false;
+            this.pythonStatusLabel.Anchor = System.Windows.Forms.AnchorStyles.Right;
+            this.pythonStatusLabel.Font = new System.Drawing.Font("Segoe UI", 8.5F);
+            this.pythonStatusLabel.ForeColor = System.Drawing.Color.FromArgb(160, 160, 160);
+            this.pythonStatusLabel.Location = new System.Drawing.Point(573, 111);
+            this.pythonStatusLabel.Name = "pythonStatusLabel";
+            this.pythonStatusLabel.Size = new System.Drawing.Size(104, 37);
+            this.pythonStatusLabel.Text = "Waiting";
+            this.pythonStatusLabel.TextAlign = System.Drawing.ContentAlignment.MiddleRight;
+            //
+            // overallProgress
+            //
+            this.overallProgress.Location = new System.Drawing.Point(20, 168);
+            this.overallProgress.Name = "overallProgress";
+            this.overallProgress.Size = new System.Drawing.Size(680, 8);
+            this.overallProgress.Style = System.Windows.Forms.ProgressBarStyle.Continuous;
+            this.overallProgress.TabIndex = 1;
+            //
+            // completedLabel
+            //
+            this.completedLabel.Font = new System.Drawing.Font("Segoe UI", 8.5F);
+            this.completedLabel.ForeColor = System.Drawing.Color.FromArgb(120, 120, 120);
+            this.completedLabel.Location = new System.Drawing.Point(20, 180);
+            this.completedLabel.Name = "completedLabel";
+            this.completedLabel.Size = new System.Drawing.Size(220, 18);
+            this.completedLabel.TabIndex = 2;
+            this.completedLabel.Text = "Completed: 0/0 components";
+            //
+            // elapsedTimeLabel
+            //
+            this.elapsedTimeLabel.Font = new System.Drawing.Font("Segoe UI", 8.5F);
+            this.elapsedTimeLabel.ForeColor = System.Drawing.Color.FromArgb(120, 120, 120);
+            this.elapsedTimeLabel.Location = new System.Drawing.Point(240, 180);
+            this.elapsedTimeLabel.Name = "elapsedTimeLabel";
+            this.elapsedTimeLabel.Size = new System.Drawing.Size(140, 18);
+            this.elapsedTimeLabel.TabIndex = 3;
+            this.elapsedTimeLabel.Text = "Elapsed: 00:00:00";
+            //
+            // currentTaskLabel
+            //
+            this.currentTaskLabel.Font = new System.Drawing.Font("Segoe UI", 8.5F);
+            this.currentTaskLabel.ForeColor = System.Drawing.Color.FromArgb(0, 120, 212);
+            this.currentTaskLabel.Location = new System.Drawing.Point(380, 180);
+            this.currentTaskLabel.Name = "currentTaskLabel";
+            this.currentTaskLabel.Size = new System.Drawing.Size(320, 18);
+            this.currentTaskLabel.TabIndex = 4;
+            this.currentTaskLabel.TextAlign = System.Drawing.ContentAlignment.MiddleRight;
+            //
+            // logHeaderLabel
+            //
+            this.logHeaderLabel.AutoSize = true;
+            this.logHeaderLabel.Font = new System.Drawing.Font("Segoe UI", 8F);
+            this.logHeaderLabel.ForeColor = System.Drawing.Color.FromArgb(140, 140, 140);
+            this.logHeaderLabel.Location = new System.Drawing.Point(20, 206);
+            this.logHeaderLabel.Name = "logHeaderLabel";
+            this.logHeaderLabel.Size = new System.Drawing.Size(64, 13);
+            this.logHeaderLabel.TabIndex = 5;
+            this.logHeaderLabel.Text = "Activity Log";
+            //
+            // activityLog
+            //
+            this.activityLog.BackColor = System.Drawing.Color.FromArgb(30, 30, 30);
+            this.activityLog.BorderStyle = System.Windows.Forms.BorderStyle.None;
+            this.activityLog.Font = new System.Drawing.Font("Consolas", 8.25F);
+            this.activityLog.ForeColor = System.Drawing.Color.FromArgb(204, 204, 204);
+            this.activityLog.Location = new System.Drawing.Point(20, 224);
+            this.activityLog.Multiline = true;
+            this.activityLog.Name = "activityLog";
+            this.activityLog.ReadOnly = true;
+            this.activityLog.ScrollBars = System.Windows.Forms.ScrollBars.Vertical;
+            this.activityLog.Size = new System.Drawing.Size(680, 112);
+            this.activityLog.TabIndex = 6;
+            this.activityLog.TabStop = false;
+            //
+            // InstallForm
+            //
+            this.BackColor = System.Drawing.Color.White;
+            this.ClientSize = new System.Drawing.Size(720, 530);
+            this.Controls.Add(this.progressPanel);
+            this.Controls.Add(this.separatorPanel);
+            this.Controls.Add(this.settingsPanel);
+            this.Controls.Add(this.headerPanel);
+            this.FormBorderStyle = System.Windows.Forms.FormBorderStyle.None;
+            this.MaximizeBox = false;
+            this.Name = "InstallForm";
+            this.StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen;
+            this.Text = "DevEnv Setup";
+            this.TopMost = true;
+            this.headerPanel.ResumeLayout(false);
+            this.headerPanel.PerformLayout();
+            this.settingsPanel.ResumeLayout(false);
+            this.settingsPanel.PerformLayout();
+            this.componentTable.ResumeLayout(false);
+            this.progressPanel.ResumeLayout(false);
+            this.progressPanel.PerformLayout();
+            this.ResumeLayout(false);
+        }
+
+        #endregion
+
+        private System.Windows.Forms.Panel headerPanel;
+        private System.Windows.Forms.Label headerTitleLabel;
+        private System.Windows.Forms.Label headerSubLabel;
+        private System.Windows.Forms.Panel settingsPanel;
+        private System.Windows.Forms.Label pathLabel;
+        private System.Windows.Forms.TextBox installPathTextBox;
+        private System.Windows.Forms.Button browseButton;
+        private System.Windows.Forms.Label pythonLabel;
+        private System.Windows.Forms.TextBox pythonVersionTextBox;
+        private System.Windows.Forms.Label pythonHint;
+        private System.Windows.Forms.Button installButton;
+        private System.Windows.Forms.Button cancelButton;
+        private System.Windows.Forms.Label label1;
+        private System.Windows.Forms.Panel separatorPanel;
+        private System.Windows.Forms.Panel progressPanel;
+        private System.Windows.Forms.TableLayoutPanel componentTable;
+        private System.Windows.Forms.Label fontsNameLabel;
+        private System.Windows.Forms.ProgressBar fontsProgressBar;
+        private System.Windows.Forms.Label fontsStatusLabel;
+        private System.Windows.Forms.Label pwshNameLabel;
+        private System.Windows.Forms.ProgressBar pwshProgressBar;
+        private System.Windows.Forms.Label pwshStatusLabel;
+        private System.Windows.Forms.Label vscodeNameLabel;
+        private System.Windows.Forms.ProgressBar vscodeProgressBar;
+        private System.Windows.Forms.Label vscodeStatusLabel;
+        private System.Windows.Forms.Label pythonNameLabel;
+        private System.Windows.Forms.ProgressBar pythonProgressBar;
+        private System.Windows.Forms.Label pythonStatusLabel;
+        private System.Windows.Forms.ProgressBar overallProgress;
+        private System.Windows.Forms.Label completedLabel;
+        private System.Windows.Forms.Label elapsedTimeLabel;
+        private System.Windows.Forms.Label currentTaskLabel;
+        private System.Windows.Forms.Label logHeaderLabel;
+        private System.Windows.Forms.TextBox activityLog;
+    }
+}

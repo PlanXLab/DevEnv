@@ -1,0 +1,2992 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.IO;
+using System.IO.Compression;
+using System.Linq;
+using System.Net.Http;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using Microsoft.Win32;
+using VSCodePortableCommon;
+
+namespace VSCodePortableInstaller
+{
+    partial class InstallForm : Form
+    {
+        // Constants
+        private const int FORM_WIDTH = 700;
+        private const int FORM_HEIGHT = 750;
+        private const int MAX_DOWNLOAD_TIMEOUT_MINUTES = 10;
+        private const int POWERSHELL_HEADSTART_MS = 8000;
+        private const int BUFFER_SIZE = 131072;  // 128KB for faster I/O
+        private const int DOWNLOAD_BUFFER_SIZE = 1048576;  // 1MB for download operations (optimized)
+        private const int EXTRACT_BUFFER_SIZE = 131072;  // 128KB for faster extraction
+        
+        // URLs
+        private const string PYTHON_DOWNLOADS_URL = "https://www.python.org/downloads/windows/";
+        private const string PYTHON_FTP_BASE = "https://www.python.org/ftp/python/";
+        private const string BOOTSTRAP_PIP_URL = "https://bootstrap.pypa.io/get-pip.py";
+        
+        // Paths
+        private const string TEMP_INSTALL_DIR = "vscode-pvs-install";
+        
+        // Win32 API for extracting icon from exe
+        [DllImport("shell32.dll", CharSet = CharSet.Auto)]
+        static extern IntPtr ExtractIcon(IntPtr hInst, string lpszExeFileName, int nIconIndex);
+
+        // Win32 API for borderless window dragging
+        [DllImport("user32.dll")]
+        static extern int ReleaseCapture();
+        [DllImport("user32.dll")]
+        static extern int SendMessage(IntPtr hWnd, int Msg, int wParam, int lParam);
+        private const int WM_NCLBUTTONDOWN = 0xA1;
+        private const int HTCAPTION = 0x2;
+        
+        private string installDir;
+        private string pythonVersionInput;
+        private int totalComponents;
+        private int completedComponents;
+        private bool installCompleted;
+        private bool installStarted;
+        private bool pwsh7Failed;
+        private bool criticalFailed;
+        private volatile bool vscodeDownloadCompleted;
+        private System.Diagnostics.Stopwatch installTimer;
+        private DateTime installStartTime;
+        private System.Threading.CancellationTokenSource installCancellationSource;
+        private System.Windows.Forms.Timer elapsedTimer;
+        private StringBuilder logFileBuffer = new StringBuilder();
+        private object logFileLock = new object();
+
+        // New: collapse/expand state and stored full size
+        private bool isCollapsedOnStart = true;
+        private Size fullClientSize;
+
+        public InstallForm()
+        {
+            totalComponents = 4;
+            completedComponents = 0;
+            installCompleted = false;
+            installStarted = false;
+            pwsh7Failed = false;
+
+            // Optimize network performance
+            System.Net.ServicePointManager.DefaultConnectionLimit = 100;
+            System.Net.ServicePointManager.Expect100Continue = false;
+
+            InitializeComponent();
+
+            // Capture full size (designer size) for later restore
+            fullClientSize = this.ClientSize;
+
+            // Set form icon (extract from exe's win32 icon resource)
+            try
+            {
+                string exePath = Assembly.GetExecutingAssembly().Location;
+                IntPtr hIcon = ExtractIcon(IntPtr.Zero, exePath, 0);
+                if (hIcon != IntPtr.Zero)
+                {
+                    Icon = Icon.FromHandle(hIcon);
+                }
+            }
+            catch { /* Ignore icon errors */ }
+
+            // Enable dragging from header panel (borderless window)
+            headerPanel.MouseDown += HeaderPanel_MouseDown;
+            headerTitleLabel.MouseDown += HeaderPanel_MouseDown;
+            headerSubLabel.MouseDown += HeaderPanel_MouseDown;
+
+            // Start collapsed view so only top area (including Install button) is visible.
+            // Controls tagged "progress" will be hidden and form will be resized smaller.
+            CollapseFormToInstallButton();
+        }
+
+        private void CollapseFormToInstallButton()
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action(CollapseFormToInstallButton));
+                return;
+            }
+
+            try
+            {
+                // Hide progress UI
+                if (progressPanel != null)
+                    progressPanel.Visible = false;
+                if (separatorPanel != null)
+                    separatorPanel.Visible = false;
+
+                // Compute minimal height so settings area is visible with margin
+                int margin = 20;
+                int minimalHeight = settingsPanel.Bottom + margin;
+                
+                // Do not make it smaller than a reasonable value
+                minimalHeight = Math.Max(minimalHeight, 100);
+
+                // Set client size to full width designer had, but reduced height
+                this.ClientSize = new Size(fullClientSize.Width, minimalHeight);
+
+                // Center on screen to look polished
+                this.CenterToScreen();
+
+                isCollapsedOnStart = true;
+            }
+            catch { /* non-critical */ }
+        }
+
+        private void HeaderPanel_MouseDown(object sender, MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Left)
+            {
+                ReleaseCapture();
+                SendMessage(this.Handle, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+            }
+        }
+
+        private void ExpandFormToFullSize()
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action(ExpandFormToFullSize));
+                return;
+            }
+
+            try
+            {
+                // Make progress controls visible
+                ShowProgressUI();
+
+                // Restore full client size
+                this.ClientSize = fullClientSize;
+
+                // Center on screen again
+                this.CenterToScreen();
+
+                // Allow immediate redraw so user sees expansion before heavy work
+                Application.DoEvents();
+
+                isCollapsedOnStart = false;
+            }
+            catch { /* non-critical */ }
+        }
+
+        private void BrowseButton_Click(object sender, EventArgs e)
+        {
+            using (var dialog = new FolderBrowserDialog())
+            {
+                dialog.Description = "Select installation directory";
+                dialog.ShowNewFolderButton = true;
+                
+                if (dialog.ShowDialog() == DialogResult.OK)
+                {
+                    installPathTextBox.Text = dialog.SelectedPath;
+                }
+            }
+        }
+
+        private void InstallButton_Click(object sender, EventArgs e)
+        {
+            // If installation completed and no failures, Exit button closes the form
+            if (installCompleted && !pwsh7Failed && !criticalFailed)
+            {
+                Close();
+                return;
+            }
+
+            // If PowerShell 7 failed, retry only PowerShell 7 installation
+            if (installCompleted && pwsh7Failed && !criticalFailed)
+            {
+                RetryPowerShell7Installation();
+                return;
+            }
+            
+            // If critical components failed, retry full installation
+            if (installCompleted && criticalFailed)
+            {
+                RetryInstallation();
+                return;
+            }
+
+            if (installStarted)
+                return;
+
+            // New behavior: if form was collapsed at start, expand to full UI when Install is pressed
+            if (isCollapsedOnStart && !installStarted)
+            {
+                ExpandFormToFullSize();
+            }
+
+            string path = installPathTextBox.Text.Trim();
+            
+            // Validate path format
+            if (!ValidateInstallPath(path))
+                return;
+
+            // Get Python version input from field
+            if (pythonVersionTextBox != null)
+                pythonVersionInput = pythonVersionTextBox.Text.Trim();
+            else
+                pythonVersionInput = "";
+
+            // Validate Python version format
+            if (!ValidatePythonVersion(pythonVersionInput))
+                return;
+
+            installDir = path;
+            installStarted = true;
+
+            // Initialize cancellation token for graceful cancellation
+            installCancellationSource = new System.Threading.CancellationTokenSource();
+
+            // Start performance timer
+            installTimer = System.Diagnostics.Stopwatch.StartNew();
+            installStartTime = DateTime.Now;
+            vscodeDownloadCompleted = false;
+            LogActivity("=== Installation started at " + installStartTime.ToString("HH:mm:ss") + " ===");
+
+            // Start elapsed time timer (update every second)
+            StartElapsedTimer();
+
+            // Show progress UI
+            ShowProgressUI();
+
+            // Disable path controls
+            installPathTextBox.Enabled = false;
+            browseButton.Enabled = false;
+            // Apply clear disabled visual state to Install button
+            SetInstallButtonInstallingState();
+            pythonVersionTextBox.Enabled = false;
+
+            // Start installation
+            var token = installCancellationSource.Token;
+            Task.Run(async () =>
+            {
+                await PerformInstallation(token);
+            }, token);
+        }
+
+        private void CancelButton_Click(object sender, EventArgs e)
+        {
+            if (!installStarted)
+            {
+                Close();
+                return;
+            }
+
+            if (!installCompleted)
+            {
+                // Ask for confirmation BEFORE cancelling
+                var result = MessageBox.Show(
+                    "Are you sure you want to cancel the installation?\n\n" +
+                    "All downloaded files and the installation directory will be deleted.",
+                    "Cancel Installation",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Warning);
+
+                if (result == DialogResult.Yes)
+                {
+                    // User confirmed - cancel immediately and cleanup
+                    LogActivity("Installation cancelled by user");
+                    
+                    // Disable buttons immediately to prevent multiple clicks
+                    installButton.Enabled = false;
+                    cancelButton.Enabled = false;
+                    
+                    // Request cancellation
+                    if (installCancellationSource != null && !installCancellationSource.IsCancellationRequested)
+                    {
+                        installCancellationSource.Cancel();
+                        LogActivity("Cancellation requested for all tasks");
+                    }
+                    
+                    UpdateCurrentTask("Cancelling installation...");
+                    
+                    // Hide main window
+                    this.Hide();
+                    
+                    // Show progress dialog in a separate thread
+                    Task.Run(() =>
+                    {
+                        Form progressDialog = null;
+                        Label progressLabel = null;
+                        System.Windows.Forms.Timer animationTimer = null;
+                        int spinnerIndex = 0;
+                        string[] spinnerChars = new string[] { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
+                        string baseMessage = "";
+                        
+                        try
+                        {
+                            // Create and show progress dialog on UI thread
+                            Invoke(new Action(() =>
+                            {
+                                progressDialog = new Form
+                                {
+                                    Text = "Cleaning up...",
+                                    Width = 400,
+                                    Height = 150,
+                                    FormBorderStyle = FormBorderStyle.FixedDialog,
+                                    StartPosition = FormStartPosition.Manual,
+                                    MaximizeBox = false,
+                                    MinimizeBox = false,
+                                    ControlBox = false,
+                                    TopMost = true
+                                };
+                                
+                                // Center on main window's location
+                                int x = this.Left + (this.Width - progressDialog.Width) / 2;
+                                int y = this.Top + (this.Height - progressDialog.Height) / 2;
+                                progressDialog.Location = new System.Drawing.Point(x, y);
+                                
+                                progressLabel = new Label
+                                {
+                                    Text = "⠋ Stopping tasks",
+                                    AutoSize = false,
+                                    Width = 360,
+                                    Height = 60,
+                                    Left = 20,
+                                    Top = 30,
+                                    Font = new System.Drawing.Font("Segoe UI", 10F),
+                                    TextAlign = System.Drawing.ContentAlignment.MiddleLeft
+                                };
+                                
+                                progressDialog.Controls.Add(progressLabel);
+                                
+                                // Setup animation timer
+                                baseMessage = "Stopping tasks";
+                                animationTimer = new System.Windows.Forms.Timer();
+                                animationTimer.Interval = 100; // Update every 100ms for smooth rotation
+                                animationTimer.Tick += (tmr, evt) =>
+                                {
+                                    spinnerIndex = (spinnerIndex + 1) % spinnerChars.Length;
+                                    progressLabel.Text = spinnerChars[spinnerIndex] + " " + baseMessage;
+                                };
+                                animationTimer.Start();
+                                
+                                progressDialog.Show(this);
+                                Application.DoEvents();
+                            }));
+                            
+                            // Brief delay to allow tasks to respond to cancellation
+                            LogActivity("Waiting for tasks to cancel...");
+                            System.Threading.Thread.Sleep(500);
+                            
+                            // Update progress
+                            Invoke(new Action(() =>
+                            {
+                                if (progressLabel != null)
+                                {
+                                    baseMessage = "Terminating processes";
+                                    spinnerIndex = 0;
+                                }
+                                Application.DoEvents();
+                            }));
+                            
+                            LogActivity("Cleaning up temporary files and installation directory...");
+                            CleanupOnCancel(progressLabel, () => baseMessage, (msg) => { baseMessage = msg; spinnerIndex = 0; });
+                            
+                            // Update progress
+                            Invoke(new Action(() =>
+                            {
+                                if (progressLabel != null)
+                                {
+                                    baseMessage = "Cleanup completed. Exiting";
+                                    spinnerIndex = 0;
+                                }
+                                Application.DoEvents();
+                            }));
+                            
+                            LogActivity("Cleanup completed. Exiting...");
+                            System.Threading.Thread.Sleep(500); // Brief delay to show final message
+                        }
+                        catch (Exception ex)
+                        {
+                            LogActivity("Cleanup error: " + ex.Message);
+                        }
+                        finally
+                        {
+                            // Stop animation timer
+                            try
+                            {
+                                if (animationTimer != null)
+                                {
+                                    Invoke(new Action(() =>
+                                    {
+                                        animationTimer.Stop();
+                                        animationTimer.Dispose();
+                                    }));
+                                }
+                            }
+                            catch { }
+                            
+                            // Close progress dialog
+                            try
+                            {
+                                if (progressDialog != null)
+                                {
+                                    Invoke(new Action(() =>
+                                    {
+                                        progressDialog.Close();
+                                        progressDialog.Dispose();
+                                    }));
+                                }
+                            }
+                            catch { }
+                            
+                            // Force exit
+                            Environment.Exit(0);
+                        }
+                    });
+                }
+                // If user clicked No, do nothing - installation continues
+            }
+            else
+            {
+                Close();
+            }
+        }
+
+        private void CleanupOnCancel(Label progressLabel = null, Func<string> getBaseMessage = null, Action<string> setBaseMessage = null)
+        {
+            // Kill any running VSCode or PowerShell processes from installation directory
+            UpdateProgressLabel(progressLabel, "Terminating running processes", setBaseMessage);
+            KillInstallationProcesses();
+            
+            // Brief delay to ensure processes are terminated
+            System.Threading.Thread.Sleep(1000);
+            
+            // 1. Clean temporary directories
+            UpdateProgressLabel(progressLabel, "Deleting temporary directories", setBaseMessage);
+            string[] tempDirs = {
+                Path.Combine(Path.GetTempPath(), "vscode-pvs-install"),
+                Path.Combine(Path.GetTempPath(), "python-pvs-install"),
+                Path.Combine(Path.GetTempPath(), "pwsh7-pvs-install")
+            };
+
+            foreach (string tempDir in tempDirs)
+            {
+                try
+                {
+                    if (Directory.Exists(tempDir))
+                    {
+                        Directory.Delete(tempDir, true);
+                        LogActivity("Deleted temp directory: " + tempDir);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogActivity("Failed to delete " + tempDir + ": " + ex.Message);
+                }
+            }
+
+            // 2. Delete installation directory (PVS folder)
+            UpdateProgressLabel(progressLabel, "Deleting installation directory", setBaseMessage);
+            if (!string.IsNullOrEmpty(installDir) && Directory.Exists(installDir))
+            {
+                try
+                {
+                    // Give processes time to release file handles after being killed
+                    System.Threading.Thread.Sleep(1000);
+                    
+                    // Force delete with retry mechanism
+                    int retries = 0;
+                    while (Directory.Exists(installDir) && retries < 5)
+                    {
+                        try
+                        {
+                            Directory.Delete(installDir, true);
+                            LogActivity("Deleted installation directory: " + installDir);
+                            break;
+                        }
+                        catch (Exception ex)
+                        {
+                            retries++;
+                            if (retries < 5)
+                            {
+                                UpdateProgressLabel(progressLabel, "Retrying deletion (" + retries + "/5)", setBaseMessage);
+                                LogActivity("Retry " + retries + "/5: Failed to delete installation directory: " + ex.Message);
+                                
+                                // Try killing processes again on each retry
+                                if (retries % 2 == 0)
+                                {
+                                    LogActivity("Attempting to kill processes again...");
+                                    KillInstallationProcesses();
+                                    System.Threading.Thread.Sleep(500);
+                                }
+                                else
+                                {
+                                    System.Threading.Thread.Sleep(500);
+                                }
+                            }
+                            else
+                            {
+                                LogActivity("Failed to delete installation directory after 5 retries: " + ex.Message);
+                                
+                                // Try to delete individual subdirectories if full deletion fails
+                                try
+                                {
+                                    string dataDir = Path.Combine(installDir, "data");
+                                    if (Directory.Exists(dataDir))
+                                    {
+                                        Directory.Delete(dataDir, true);
+                                        LogActivity("Deleted data directory");
+                                    }
+                                }
+                                catch { }
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogActivity("Failed to delete installation directory: " + ex.Message);
+                }
+            }
+
+            LogActivity("Cleanup completed");
+        }
+
+        private void UpdateProgressLabel(Label label, string text, Action<string> setBaseMessage = null)
+        {
+            if (label == null)
+                return;
+                
+            try
+            {
+                Invoke(new Action(() =>
+                {
+                    if (setBaseMessage != null)
+                    {
+                        setBaseMessage(text);
+                    }
+                    else
+                    {
+                        label.Text = text;
+                    }
+                    Application.DoEvents();
+                }));
+            }
+            catch
+            {
+                // Ignore errors if form is closing
+            }
+        }
+
+        private void KillInstallationProcesses()
+        {
+            if (string.IsNullOrEmpty(installDir) || !Directory.Exists(installDir))
+                return;
+
+            try
+            {
+                // Define process names and paths to kill
+                var processesToKill = new List<string>();
+                
+                // VSCode processes
+                string codeExePath = Path.Combine(installDir, "data", "lib", "vscode", "Code.exe");
+                string codeHelperPath = Path.Combine(installDir, "data", "lib", "vscode", "Code Helper.exe");
+                
+                // PowerShell 7 processes
+                string pwshExePath = Path.Combine(installDir, "data", "lib", "pwsh", "pwsh.exe");
+                
+                // Python processes (less likely but possible)
+                string pythonExePath = Path.Combine(installDir, "data", "lib", "python", "python.exe");
+                
+                int killedCount = 0;
+                
+                // Get all running processes
+                var allProcesses = Process.GetProcesses();
+                
+                foreach (var process in allProcesses)
+                {
+                    try
+                    {
+                        // Skip if we can't access the process
+                        if (process.HasExited)
+                            continue;
+                        
+                        string processPath = "";
+                        try
+                        {
+                            processPath = process.MainModule.FileName;
+                        }
+                        catch
+                        {
+                            // Can't access process path (permission issues) - skip
+                            continue;
+                        }
+                        
+                        // Check if process is running from our installation directory
+                        if (!string.IsNullOrEmpty(processPath) && 
+                            processPath.StartsWith(installDir, StringComparison.OrdinalIgnoreCase))
+                        {
+                            LogActivity("Killing process: " + process.ProcessName + " (PID: " + process.Id + ")");
+                            process.Kill();
+                            process.WaitForExit(2000); // Wait up to 2 seconds for process to exit
+                            killedCount++;
+                        }
+                        // Also check specific process names that might be from our installation
+                        else if (processPath.Equals(codeExePath, StringComparison.OrdinalIgnoreCase) ||
+                                 processPath.Equals(codeHelperPath, StringComparison.OrdinalIgnoreCase) ||
+                                 processPath.Equals(pwshExePath, StringComparison.OrdinalIgnoreCase) ||
+                                 processPath.Equals(pythonExePath, StringComparison.OrdinalIgnoreCase))
+                        {
+                            LogActivity("Killing process: " + process.ProcessName + " (PID: " + process.Id + ")");
+                            process.Kill();
+                            process.WaitForExit(2000);
+                            killedCount++;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        // Process might have already exited or we don't have permission
+                        LogActivity("Failed to kill process " + process.ProcessName + ": " + ex.Message);
+                    }
+                    finally
+                    {
+                        process.Dispose();
+                    }
+                }
+                
+                if (killedCount > 0)
+                {
+                    LogActivity("Killed " + killedCount + " process(es) from installation directory");
+                }
+                else
+                {
+                    LogActivity("No processes found running from installation directory");
+                }
+            }
+            catch (Exception ex)
+            {
+                LogActivity("Error while killing processes: " + ex.Message);
+            }
+        }
+
+        private bool ValidateInstallPath(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                MessageBox.Show("Please enter an installation path.", "Invalid Path",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return false;
+            }
+
+            // Validate format: drive:\name (no trailing backslash except root)
+            var match = Regex.Match(path, @"^[A-Za-z]:\\[^\\]+.*$");
+            if (!match.Success)
+            {
+                MessageBox.Show(
+                    "Invalid path format. Must be drive:\\name (e.g., D:\\VSCode, D:\\Dev\\VSCode)",
+                    "Invalid Path",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return false;
+            }
+
+            // Check if path ends with backslash (not allowed except root)
+            if (path.EndsWith("\\") && path.Length > 3)
+            {
+                MessageBox.Show(
+                    "Trailing backslash is not allowed.",
+                    "Invalid Path",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return false;
+            }
+
+            return true;
+        }
+
+        private bool ValidatePythonVersion(string version)
+        {
+            // Empty string means "latest" - this is valid
+            if (string.IsNullOrWhiteSpace(version))
+                return true;
+
+            // Must be in format "3.12", "3.11", etc. (major.minor)
+            var match = Regex.Match(version, @"^3\.\d+$");
+            if (!match.Success)
+            {
+                MessageBox.Show(
+                    "Invalid Python version format.\n\n" +
+                    "Valid formats:\n" +
+                    "  • 3.12, 3.11, 3.10, etc. (specific version)\n" +
+                    "  • Leave empty for latest version\n\n" +
+                    "Invalid: 3, 3., 3.x, etc.",
+                    "Invalid Python Version",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return false;
+            }
+
+            // Check if version exists online (with timeout)
+            try
+            {
+                Cursor.Current = Cursors.WaitCursor;
+                
+                // Use Task.Run to avoid deadlock on UI thread
+                var checkTask = Task.Run(async () => await CheckPythonVersionExists(version));
+                
+                // Wait with timeout (5 seconds)
+                if (checkTask.Wait(TimeSpan.FromSeconds(5)))
+                {
+                    if (!checkTask.Result)
+                    {
+                        MessageBox.Show(
+                            "Python version " + version + " not found.\n\n" +
+                            "Please check https://www.python.org/downloads/ for available versions.\n\n" +
+                            "Common versions: 3.13, 3.12, 3.11, 3.10",
+                            "Python Version Not Found",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Warning);
+                        Cursor.Current = Cursors.Default;
+                        return false;
+                    }
+                }
+                else
+                {
+                    // Timeout - allow to proceed (will check again during installation)
+                    LogActivity("Python version check timeout - proceeding anyway");
+                }
+                
+                Cursor.Current = Cursors.Default;
+            }
+            catch (Exception ex)
+            {
+                Cursor.Current = Cursors.Default;
+                LogActivity("Python version check error: " + ex.Message);
+                // Network error - allow to proceed (will fail later with better error)
+            }
+
+            return true;
+        }
+
+        private async Task<bool> CheckPythonVersionExists(string majorMinor)
+        {
+            try
+            {
+                System.Net.ServicePointManager.SecurityProtocol = (System.Net.SecurityProtocolType)3072;
+                
+                var handler = new HttpClientHandler
+                {
+                    AutomaticDecompression = System.Net.DecompressionMethods.GZip | System.Net.DecompressionMethods.Deflate
+                };
+                
+                using (var client = new HttpClient(handler))
+                {
+                    client.Timeout = TimeSpan.FromSeconds(5); // Quick check
+                    client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
+                    string html = await client.GetStringAsync(PYTHON_DOWNLOADS_URL);
+                    
+                    // Check if the version appears in the downloads page
+                    var pattern = @"Python\s+" + majorMinor.Replace(".", @"\.") + @"\.\d+";
+                    return Regex.IsMatch(html, pattern);
+                }
+            }
+            catch
+            {
+                return true; // Network error - assume valid (will check again during installation)
+            }
+        }
+
+        private void ShowProgressUI()
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action(ShowProgressUI));
+                return;
+            }
+
+            // Show progress panel and separator
+            if (progressPanel != null)
+                progressPanel.Visible = true;
+            if (separatorPanel != null)
+                separatorPanel.Visible = true;
+        }
+
+        // Helper methods to clearly indicate Install button state
+        private void SetInstallButtonInstallingState()
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action(SetInstallButtonInstallingState));
+                return;
+            }
+
+            try
+            {
+                installButton.Enabled = false;
+                installButton.Text = "Installing...";
+                
+                // Clear disabled appearance: gray background, dark gray text, wait cursor
+                installButton.BackColor = Color.FromArgb(200, 200, 200);
+                installButton.ForeColor = Color.FromArgb(100, 100, 100);
+                installButton.FlatStyle = FlatStyle.Flat;
+                installButton.FlatAppearance.BorderSize = 0;
+                installButton.Cursor = Cursors.WaitCursor;
+            }
+            catch { }
+        }
+
+        private void RestoreInstallButtonStyle(string text = "Install", Color? backColor = null, Color? foreColor = null)
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action(() => RestoreInstallButtonStyle(text, backColor, foreColor)));
+                return;
+            }
+
+            try
+            {
+                installButton.Enabled = true;
+                installButton.Text = text;
+                
+                // Restore active button style
+                installButton.BackColor = backColor ?? Color.FromArgb(0, 120, 212);
+                installButton.ForeColor = foreColor ?? Color.White;
+                installButton.FlatStyle = FlatStyle.Flat;
+                installButton.FlatAppearance.BorderSize = 0;
+                installButton.Cursor = Cursors.Hand;
+            }
+            catch { }
+        }
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                CreateParams cp = base.CreateParams;
+                cp.Style |= 0x00800000; // WS_BORDER
+                return cp;
+            }
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            // Prevent closing during installation (unless force exit is requested)
+            if (installStarted && !installCompleted && e.CloseReason == CloseReason.UserClosing)
+            {
+                e.Cancel = true;
+                var result = MessageBox.Show(
+                    "Installation is in progress. Are you sure you want to cancel?",
+                    "Cancel Installation",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Warning);
+                
+                if (result == DialogResult.Yes)
+                {
+                    LogActivity("Installation cancelled by user (force close)");
+                    Environment.Exit(0); // Force terminate entire process
+                }
+            }
+            base.OnFormClosing(e);
+        }
+
+        private async Task PerformInstallation(System.Threading.CancellationToken cancellationToken)
+        {
+            try
+            {
+                // Check for cancellation before starting
+                cancellationToken.ThrowIfCancellationRequested();
+                
+                // Optimize HTTP connection settings for faster downloads
+                System.Net.ServicePointManager.DefaultConnectionLimit = 10;
+                System.Net.ServicePointManager.MaxServicePointIdleTime = 10000;
+                System.Net.ServicePointManager.UseNagleAlgorithm = false;
+                System.Net.ServicePointManager.Expect100Continue = false;
+                System.Net.ServicePointManager.SecurityProtocol = 
+                    System.Net.SecurityProtocolType.Tls12 | 
+                    System.Net.SecurityProtocolType.Tls11 | 
+                    System.Net.SecurityProtocolType.Tls;
+                
+                // Create installation directory
+                if (!Directory.Exists(installDir))
+                {
+                    UpdateCurrentTask("Creating installation directory...");
+                    Directory.CreateDirectory(installDir);
+                }
+
+                // Phase 1A: quick installs first
+                LogActivity("Phase 1A: Installing Fonts and Python...");
+                var phase1Results = await Task.WhenAll(
+                    InstallFontsAsync(cancellationToken),
+                    InstallPythonCoreAsync(cancellationToken));
+
+                // Phase 1B: Installing VSCode and PowerShell 7...
+                LogActivity("Phase 1B: Installing VSCode and PowerShell 7...");
+                var powerShellTask = InstallPowerShell7Async(cancellationToken);
+                var vscodeTask = InstallVSCodeFlowAsync(cancellationToken);
+                var phase1BResults = await Task.WhenAll(vscodeTask, powerShellTask);
+
+                // Collect all version info from staged parallel phases
+                var allVersions = new Dictionary<string, string>();
+                bool hasCriticalError = false;
+                int failedCount = 0;
+
+                foreach (var result in phase1Results)
+                {
+                    foreach (var kvp in result)
+                        allVersions[kvp.Key] = kvp.Value;
+                }
+                foreach (var result in phase1BResults)
+                {
+                    foreach (var kvp in result)
+                        allVersions[kvp.Key] = kvp.Value;
+                }
+                
+                // Check if critical components failed (VSCode or Python)
+                if (!allVersions.ContainsKey("VSCODE_VERSION"))
+                {
+                    LogActivity("Critical: VSCode installation failed or incomplete");
+                    hasCriticalError = true;
+                    failedCount++;
+                }
+                
+                if (!allVersions.ContainsKey("PYTHON_VERSION"))
+                {
+                    LogActivity("Critical: Python installation failed or incomplete");
+                    hasCriticalError = true;
+                    failedCount++;
+                }
+                
+                // If critical components failed, don't proceed with final configuration
+                if (hasCriticalError && !pwsh7Failed)
+                {
+                    UpdateCurrentTask("⚠ Installation incomplete - " + failedCount + " component(s) failed");
+                    LogActivity("Installation incomplete: " + failedCount + " critical component(s) failed");
+                    
+                    criticalFailed = true;
+                    installCompleted = true;
+                    Invoke(new Action(() =>
+                    {
+                        RestoreInstallButtonStyle("Retry", Color.FromArgb(220, 80, 20), Color.White);
+                        // Keep Cancel button enabled so user can always exit
+                    }));
+                    return;
+                }
+
+                // Final configuration
+                UpdateCurrentTask("Creating configuration files...");
+                
+                await CreatePvsInfo(allVersions);
+                await CopyLauncher();
+                await CreateShortcuts();
+
+                UpdateCurrentTask("✓ Installation completed successfully!");
+                LogActivity("Installation completed successfully!");
+                LogActivity("Installation directory: " + installDir);
+
+                // Stop timer and log performance
+                if (installTimer != null)
+                {
+                    installTimer.Stop();
+                    var elapsed = installTimer.Elapsed;
+                    string elapsedStr = string.Format("{0:D2}:{1:D2}:{2:D2}.{3:D3}",
+                        elapsed.Hours, elapsed.Minutes, elapsed.Seconds, elapsed.Milliseconds);
+                    LogActivity("=== Installation completed at " + DateTime.Now.ToString("HH:mm:ss") + " ===");
+                    LogActivity("*** Total installation time: " + elapsedStr + " ***");
+                }
+
+                // Stop elapsed timer
+                StopElapsedTimer();
+
+                // Save installation log to pvs.log
+                SaveInstallLog();
+
+                installCompleted = true;
+                Invoke(new Action(() =>
+                {
+                    if (pwsh7Failed)
+                    {
+                        RestoreInstallButtonStyle("Retry PowerShell 7", Color.FromArgb(220, 80, 20), Color.White);
+                    }
+                    else
+                    {
+                        RestoreInstallButtonStyle("Exit", Color.FromArgb(0, 120, 215), Color.White);
+                    }
+                    cancelButton.Enabled = false;
+                }));
+            }
+            catch (OperationCanceledException)
+            {
+                // Installation was cancelled - check if user wants to resume or exit
+                // If this exception reaches here, user clicked Yes to cancel
+                LogActivity("Installation cancelled - cleanup in progress");
+                installCompleted = false; // Keep as incomplete for cleanup
+            }
+            catch (Exception ex)
+            {
+                ShowError("Installation error: " + ex.Message);
+                installCompleted = true;
+            }
+        }
+
+        private void UpdateComponentStatus(string componentName, string status, int progress)
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action(() => UpdateComponentStatus(componentName, status, progress)));
+                return;
+            }
+
+            // Determine which controls to update based on component name
+            Label statusLabel = null;
+            ProgressBar progressBar = null;
+
+            switch (componentName)
+            {
+                case "Fonts":
+                    statusLabel = fontsStatusLabel;
+                    progressBar = fontsProgressBar;
+                    break;
+                case "PowerShell 7":
+                    statusLabel = pwshStatusLabel;
+                    progressBar = pwshProgressBar;
+                    break;
+                case "VSCode":
+                    statusLabel = vscodeStatusLabel;
+                    progressBar = vscodeProgressBar;
+                    break;
+                case "Python":
+                    statusLabel = pythonStatusLabel;
+                    progressBar = pythonProgressBar;
+                    break;
+                default:
+                    return; // Unknown component
+            }
+
+            // Categorize for color and simplified display
+            string displayStatus = status;
+            string category = "Working";
+            
+            if (status.Contains("Checking") || status.Contains("Requesting"))
+            { displayStatus = "Preparing"; category = "Working"; }
+            else if (status.Contains("Downloading") || status.Contains("download"))
+            { displayStatus = "Downloading"; category = "Downloading"; }
+            else if (status.Contains("Extracting") || status.Contains("extract"))
+            { displayStatus = "Installing"; category = "Working"; }
+            else if (status.Contains("Installing") || status.Contains("Configuring") || 
+                     status.Contains("Creating") || status.Contains("Registering") ||
+                     status.Contains("Replacing") || status.Contains("Finalizing") ||
+                     status.Contains("Cleaning") || status.Contains("Running") ||
+                     status.Contains("Core installed") ||
+                     status.Contains("Verifying"))
+            { displayStatus = "Installing"; category = "Working"; }
+            else if (status.StartsWith("✓") || status.Contains("Completed") || status.Contains("Already installed"))
+            { displayStatus = "Completed"; category = "Completed"; }
+            else if (status.StartsWith("⚠") || status.Contains("Error") || 
+                     status.Contains("not found") || status.Contains("failed"))
+            { displayStatus = "Failed"; category = "Failed"; }
+            else if (status.Contains("Waiting"))
+            { displayStatus = "Waiting"; category = "Waiting"; }
+            
+            // Color by category
+            Color statusColor = Color.FromArgb(160, 160, 160);
+            
+            if (category == "Waiting")
+                statusColor = Color.FromArgb(160, 160, 160);
+            else if (category == "Downloading")
+                statusColor = Color.FromArgb(0, 120, 212);
+            else if (category == "Working")
+                statusColor = Color.FromArgb(0, 120, 212);
+            else if (category == "Completed")
+                statusColor = Color.FromArgb(16, 124, 16);
+            else if (category == "Failed")
+                statusColor = Color.FromArgb(196, 43, 28);
+            
+            // Show simplified status text
+            statusLabel.Text = displayStatus;
+            statusLabel.ForeColor = statusColor;
+            
+            // Update progress bar
+            progressBar.Value = Math.Min(progress, 100);
+
+            UpdateOverallProgress();
+        }
+
+        private void StartElapsedTimer()
+        {
+            if (elapsedTimer != null)
+            {
+                elapsedTimer.Stop();
+                elapsedTimer.Dispose();
+            }
+
+            elapsedTimer = new System.Windows.Forms.Timer();
+            elapsedTimer.Interval = 1000; // Update every 1 second
+            elapsedTimer.Tick += (s, e) => UpdateElapsedTimeDisplay();
+            elapsedTimer.Start();
+        }
+
+        private void StopElapsedTimer()
+        {
+            if (elapsedTimer != null)
+            {
+                elapsedTimer.Stop();
+                elapsedTimer.Dispose();
+                elapsedTimer = null;
+            }
+        }
+
+        private void UpdateElapsedTimeDisplay()
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action(UpdateElapsedTimeDisplay));
+                return;
+            }
+
+            if (installTimer != null && installTimer.IsRunning && elapsedTimeLabel != null)
+            {
+                var elapsed = installTimer.Elapsed;
+                string elapsedStr = string.Format("{0:D2}:{1:D2}:{2:D2}",
+                    elapsed.Hours, elapsed.Minutes, elapsed.Seconds);
+                elapsedTimeLabel.Text = "Elapsed: " + elapsedStr;
+            }
+        }
+
+        private void UpdateOverallProgress()
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action(UpdateOverallProgress));
+                return;
+            }
+
+            // Weight-based progress calculation
+            var weights = new Dictionary<string, double>
+            {
+                { "Fonts", 0.05 },
+                { "PowerShell 7", 0.30 },
+                { "VSCode", 0.40 },
+                { "Python", 0.25 }
+            };
+
+            double totalProgress = 0;
+            totalProgress += fontsProgressBar.Value * weights["Fonts"];
+            totalProgress += pwshProgressBar.Value * weights["PowerShell 7"];
+            totalProgress += vscodeProgressBar.Value * weights["VSCode"];
+            totalProgress += pythonProgressBar.Value * weights["Python"];
+
+            int avgProgress = (int)Math.Min(totalProgress, 100);
+            overallProgress.Value = avgProgress;
+
+            // Count completed components (progress >= 100)
+            int completed = 0;
+            if (fontsProgressBar.Value >= 100) completed++;
+            if (pwshProgressBar.Value >= 100) completed++;
+            if (vscodeProgressBar.Value >= 100) completed++;
+            if (pythonProgressBar.Value >= 100) completed++;
+            
+            if (completed != completedComponents)
+            {
+                completedComponents = completed;
+                UpdateCompletedLabel();
+            }
+            
+            // Update current task message based on active component
+            string currentTask = "";
+            string currentStatus = "";
+            
+            if (fontsProgressBar.Value > 0 && fontsProgressBar.Value < 100)
+            {
+                currentTask = "Fonts";
+                currentStatus = fontsStatusLabel.Text.Replace("⏳ ", "").Replace("⬇ ", "").Replace("⚙ ", "").Replace("✓ ", "");
+            }
+            else if (pwshProgressBar.Value > 0 && pwshProgressBar.Value < 100)
+            {
+                currentTask = "PowerShell 7";
+                currentStatus = pwshStatusLabel.Text.Replace("⏳ ", "").Replace("⬇ ", "").Replace("⚙ ", "").Replace("✓ ", "");
+            }
+            else if (vscodeProgressBar.Value > 0 && vscodeProgressBar.Value < 100)
+            {
+                currentTask = "VSCode";
+                currentStatus = vscodeStatusLabel.Text.Replace("⏳ ", "").Replace("⬇ ", "").Replace("⚙ ", "").Replace("✓ ", "");
+            }
+            else if (pythonProgressBar.Value > 0 && pythonProgressBar.Value < 100)
+            {
+                currentTask = "Python";
+                currentStatus = pythonStatusLabel.Text.Replace("⏳ ", "").Replace("⬇ ", "").Replace("⚙ ", "").Replace("✓ ", "");
+            }
+            
+            if (!string.IsNullOrEmpty(currentTask))
+            {
+                UpdateCurrentTask(currentTask + ": " + currentStatus);
+            }
+            else if (completed == totalComponents && totalComponents > 0)
+            {
+                UpdateCurrentTask("Installation completed!");
+            }
+        }
+
+        private void UpdateCompletedLabel()
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action(UpdateCompletedLabel));
+                return;
+            }
+
+            completedLabel.Text = "Completed: " + completedComponents + "/" + totalComponents + " components";
+        }
+
+        private void UpdateCurrentTask(string message)
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action(() => UpdateCurrentTask(message)));
+                return;
+            }
+
+            currentTaskLabel.Text = message;
+        }
+
+        private void LogActivity(string message, bool fileOnly = false)
+        {
+            string timestamp = DateTime.Now.ToString("HH:mm:ss");
+            string elapsed = "";
+            if (installTimer != null && installTimer.IsRunning)
+            {
+                var e = installTimer.Elapsed;
+                elapsed = string.Format(" +{0:D2}:{1:D2}", (int)e.TotalMinutes, e.Seconds);
+            }
+            string logEntry = "[" + timestamp + elapsed + "] " + message + "\r\n";
+            
+            // Always append to log file buffer
+            lock (logFileLock)
+            {
+                logFileBuffer.Append(logEntry);
+            }
+            
+            // Skip UI update if fileOnly is true (performance optimization)
+            if (fileOnly) return;
+            
+            if (InvokeRequired)
+            {
+                Invoke(new Action(() => LogActivity(message, false))); // Don't pass fileOnly in Invoke
+                return;
+            }
+
+            activityLog.AppendText(logEntry);
+        }
+
+        private void SaveInstallLog()
+        {
+            try
+            {
+                string logPath = Path.Combine(installDir, "pvs.log");
+                string logHeader = "\r\n" + new string('=', 80) + "\r\n";
+                logHeader += "Installation Session: " + installStartTime.ToString("yyyy-MM-dd HH:mm:ss") + "\r\n";
+                logHeader += new string('=', 80) + "\r\n";
+                
+                string logContent;
+                lock (logFileLock)
+                {
+                    logContent = logFileBuffer.ToString();
+                }
+                
+                // Append to existing log file or create new one
+                File.AppendAllText(logPath, logHeader + logContent + "\r\n", Encoding.UTF8);
+                LogActivity("Installation log saved to: " + logPath);
+            }
+            catch (Exception ex)
+            {
+                LogActivity("Failed to save installation log: " + ex.Message);
+            }
+        }
+
+        private void ShowError(string message)
+        {
+            Invoke(new Action(() =>
+            {
+                MessageBox.Show(this, message, "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                Close();
+            }));
+        }
+
+        private void RetryPowerShell7Installation()
+        {
+            LogActivity("=== Retrying PowerShell 7 installation ===");
+            pwsh7Failed = false;
+            
+            // Create new cancellation token for retry
+            installCancellationSource = new System.Threading.CancellationTokenSource();
+            var token = installCancellationSource.Token;
+            
+            // Reset button state with clear disabled visual appearance
+            Invoke(new Action(() =>
+            {
+                SetInstallButtonInstallingState();
+            }));
+
+            // Retry PowerShell 7 installation
+            vscodeDownloadCompleted = true;
+            Task.Run(async () =>
+            {
+                try
+                {
+                    var versions = await InstallPowerShell7Async(token);
+                    
+                    // Update pvs.info with PowerShell versions
+                    if (versions.Count > 0)
+                    {
+                        string pvsInfoPath = Path.Combine(installDir, "data", "pvs.info");
+                        if (File.Exists(pvsInfoPath))
+                        {
+                            var lines = File.ReadAllLines(pvsInfoPath).ToList();
+                            
+                            // Update or add PowerShell-related versions
+                            foreach (var kvp in versions)
+                            {
+                                int existingIdx = lines.FindIndex(l => l.StartsWith(kvp.Key + "="));
+                                string versionLine = kvp.Key + "=" + kvp.Value;
+                                
+                                if (existingIdx >= 0)
+                                    lines[existingIdx] = versionLine;
+                                else
+                                    lines.Add(versionLine);
+                            }
+                            
+                            File.WriteAllLines(pvsInfoPath, lines, Encoding.UTF8);
+                            LogActivity("PowerShell 7: pvs.info updated");
+                        }
+                    }
+                    
+                    if (pwsh7Failed)
+                    {
+                        LogActivity("PowerShell 7: Retry failed");
+                        Invoke(new Action(() =>
+                        {
+                            RestoreInstallButtonStyle("Retry PowerShell 7", Color.FromArgb(220, 80, 20), Color.White);
+                        }));
+                    }
+                    else
+                    {
+                        LogActivity("PowerShell 7: Retry successful!");
+                        UpdateCurrentTask("✓ All components installed successfully!");
+                        Invoke(new Action(() =>
+                        {
+                            RestoreInstallButtonStyle("Exit", Color.FromArgb(0, 120, 215), Color.White);
+                        }));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogActivity("PowerShell 7: Retry error - " + ex.Message);
+                    Invoke(new Action(() =>
+                    {
+                        RestoreInstallButtonStyle("Retry PowerShell 7", Color.FromArgb(220, 80, 20), Color.White);
+                    }));
+                }
+            });
+        }
+
+        private void RetryInstallation()
+        {
+            LogActivity("=== Retrying failed components ===");
+            criticalFailed = false;
+            installCompleted = false;
+            
+            // Create new cancellation token for retry
+            installCancellationSource = new System.Threading.CancellationTokenSource();
+            var token = installCancellationSource.Token;
+            
+            // Set button to installing state
+            Invoke(new Action(() =>
+            {
+                SetInstallButtonInstallingState();
+            }));
+            
+            // Only retry components that failed (not re-install successful ones)
+            Task.Run(async () =>
+            {
+                try
+                {
+                    var allVersions = new Dictionary<string, string>();
+                    
+                    // Read existing pvs.info to get already installed versions
+                    string pvsInfoPath = Path.Combine(installDir, "pvs.info");
+                    if (File.Exists(pvsInfoPath))
+                    {
+                        var lines = File.ReadAllLines(pvsInfoPath);
+                        foreach (var line in lines)
+                        {
+                            if (line.Contains("="))
+                            {
+                                var parts = line.Split('=');
+                                if (parts.Length == 2)
+                                    allVersions[parts[0].Trim()] = parts[1].Trim();
+                            }
+                        }
+                        LogActivity("Found " + allVersions.Count + " already installed components");
+                    }
+                    
+                    // Check which critical components need retry (check both pvs.info AND disk)
+                    bool needVSCode = !allVersions.ContainsKey("VSCODE_VERSION") && !File.Exists(Path.Combine(installDir, "Code.exe"));
+                    bool needPython = !allVersions.ContainsKey("PYTHON_VERSION") && !File.Exists(Path.Combine(installDir, "data", "lib", "python", "python.exe"));
+                    
+                    if (needVSCode)
+                    {
+                        LogActivity("Retrying VSCode installation...");
+                        var vscodeVersions = await InstallVSCodeFlowAsync(token);
+                        foreach (var kvp in vscodeVersions)
+                            allVersions[kvp.Key] = kvp.Value;
+                    }
+                    else if (!allVersions.ContainsKey("VSCODE_VERSION"))
+                    {
+                        // Code.exe exists on disk but version unknown - detect it
+                        allVersions["VSCODE_VERSION"] = "installed";
+                        LogActivity("VSCode: Already installed on disk, skipping re-download");
+                        UpdateComponentStatus("VSCode", "✓ Completed", 100);
+                    }
+                    
+                    if (needPython)
+                    {
+                        LogActivity("Retrying Python installation...");
+                        var pythonVersions = await InstallPythonCoreAsync(token);
+                        foreach (var kvp in pythonVersions)
+                            allVersions[kvp.Key] = kvp.Value;
+                    }
+                    else if (!allVersions.ContainsKey("PYTHON_VERSION"))
+                    {
+                        // python.exe exists on disk but version unknown - detect it
+                        allVersions["PYTHON_VERSION"] = "installed";
+                        LogActivity("Python: Already installed on disk, skipping re-install");
+                        UpdateComponentStatus("Python", "✓ Completed", 100);
+                    }
+                    
+                    // Check if retry succeeded
+                    if (!allVersions.ContainsKey("VSCODE_VERSION") || !allVersions.ContainsKey("PYTHON_VERSION"))
+                    {
+                        int failedCount = 0;
+                        if (!allVersions.ContainsKey("VSCODE_VERSION"))
+                        {
+                            LogActivity("Critical: VSCode installation still failed");
+                            failedCount++;
+                        }
+                        if (!allVersions.ContainsKey("PYTHON_VERSION"))
+                        {
+                            LogActivity("Critical: Python installation still failed");
+                            failedCount++;
+                        }
+                        
+                        UpdateCurrentTask("⚠ Installation still incomplete - " + failedCount + " component(s) failed");
+                        LogActivity("Retry incomplete: " + failedCount + " critical component(s) still failed");
+                        
+                        criticalFailed = true;
+                        installCompleted = true;
+                        Invoke(new Action(() =>
+                        {
+                            RestoreInstallButtonStyle("Retry", Color.FromArgb(220, 80, 20), Color.White);
+                        }));
+                        return;
+                    }
+                    
+                    // Success! Complete Phase 2 configuration
+                    LogActivity("All critical components now installed successfully");
+                    UpdateCurrentTask("Creating configuration files...");
+                    
+                    await CreatePvsInfo(allVersions);
+                    await CopyLauncher();
+                    await CreateShortcuts();
+                    
+                    UpdateCurrentTask("✓ Installation completed successfully!");
+                    LogActivity("Installation completed successfully!");
+                    LogActivity("Installation directory: " + installDir);
+                    
+                    // Stop timer and log performance
+                    if (installTimer != null)
+                    {
+                        installTimer.Stop();
+                        var elapsed = installTimer.Elapsed;
+                        string elapsedStr = string.Format("{0:D2}:{1:D2}:{2:D2}.{3:D3}",
+                            elapsed.Hours, elapsed.Minutes, elapsed.Seconds, elapsed.Milliseconds);
+                        LogActivity("=== Installation completed at " + DateTime.Now.ToString("HH:mm:ss") + " ===");
+                        LogActivity("*** Total installation time: " + elapsedStr + " ***");
+                    }
+                    
+                    // Save installation log
+                    SaveInstallLog();
+                    
+                    installCompleted = true;
+                    Invoke(new Action(() =>
+                    {
+                        RestoreInstallButtonStyle("Exit", Color.FromArgb(46, 125, 50), Color.White);
+                    }));
+                }
+                catch (Exception ex)
+                {
+                    LogActivity("Retry error: " + ex.Message);
+                    UpdateCurrentTask("⚠ Retry failed: " + ex.Message);
+                    criticalFailed = true;
+                    installCompleted = true;
+                    Invoke(new Action(() =>
+                    {
+                        RestoreInstallButtonStyle("Retry", Color.FromArgb(220, 80, 20), Color.White);
+                    }));
+                }
+            });
+        }
+
+        // Installation methods
+        private Task<Dictionary<string, string>> InstallFontsAsync(System.Threading.CancellationToken cancellationToken)
+        {
+            var versions = new Dictionary<string, string>();
+            string componentName = "Fonts";
+            
+            // Check for cancellation
+            if (cancellationToken.IsCancellationRequested)
+            {
+                LogActivity("Fonts: Installation cancelled");
+                return Task.FromResult(versions);
+            }
+            
+            UpdateComponentStatus(componentName, "Installing...", 10);
+            LogActivity("Fonts: Starting installation...");
+            
+            try
+            {
+                string fontDir = Path.Combine(installDir, "data", "lib", "fonts");
+                Directory.CreateDirectory(fontDir);
+
+                bool hasNerd = File.Exists(Path.Combine(fontDir, "0xProtoNerdFont-Regular.ttf"));
+                bool hasDalseo = File.Exists(Path.Combine(fontDir, "DalseoHealingMedium.ttf"));
+
+                if (hasNerd && hasDalseo)
+                {
+                    UpdateComponentStatus(componentName, "✓ Already installed", 100);
+                    LogActivity("Fonts: Already installed");
+                    return Task.FromResult(versions);
+                }
+
+                UpdateComponentStatus(componentName, "Extracting fonts...", 30);
+
+                // Extract 0xProto Nerd Font from embedded resource
+                if (!hasNerd)
+                {
+                    LogActivity("Fonts: Extracting 0xProtoNerdFont-Regular.ttf...");
+                    var assembly = Assembly.GetExecutingAssembly();
+                    using (var stream = assembly.GetManifestResourceStream("0xProtoNerdFont-Regular.ttf"))
+                    {
+                        if (stream != null)
+                        {
+                            string nerdPath = Path.Combine(fontDir, "0xProtoNerdFont-Regular.ttf");
+                            using (var fileStream = File.Create(nerdPath))
+                            {
+                                stream.CopyTo(fileStream);
+                            }
+                        }
+                    }
+                }
+
+                UpdateComponentStatus(componentName, "Extracting fonts...", 50);
+
+                // Extract DalseoHealing Font from embedded resource
+                if (!hasDalseo)
+                {
+                    LogActivity("Fonts: Extracting DalseoHealingMedium.ttf...");
+                    var assembly = Assembly.GetExecutingAssembly();
+                    using (var stream = assembly.GetManifestResourceStream("DalseoHealingMedium.ttf"))
+                    {
+                        if (stream != null)
+                        {
+                            string dalseoPath = Path.Combine(fontDir, "DalseoHealingMedium.ttf");
+                            using (var fileStream = File.Create(dalseoPath))
+                            {
+                                stream.CopyTo(fileStream);
+                            }
+                        }
+                    }
+                }
+
+                UpdateComponentStatus(componentName, "Registering fonts...", 70);
+
+                // Register fonts in user registry
+                string nerdFontPath = Path.Combine(fontDir, "0xProtoNerdFont-Regular.ttf");
+                string dalseoFontPath = Path.Combine(fontDir, "DalseoHealingMedium.ttf");
+
+                if (File.Exists(nerdFontPath))
+                {
+                    var psi = new ProcessStartInfo
+                    {
+                        FileName = "reg",
+                        Arguments = "add \"HKCU\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts\" /v \"0xProto Nerd Font Mono\" /d \"" + nerdFontPath + "\" /f",
+                        UseShellExecute = false,
+                        CreateNoWindow = true
+                    };
+                    using (var process = Process.Start(psi))
+                        process.WaitForExit();
+                }
+
+                if (File.Exists(dalseoFontPath))
+                {
+                    var psi = new ProcessStartInfo
+                    {
+                        FileName = "reg",
+                        Arguments = "add \"HKCU\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts\" /v \"DalseoHealing\" /d \"" + dalseoFontPath + "\" /f",
+                        UseShellExecute = false,
+                        CreateNoWindow = true
+                    };
+                    using (var process = Process.Start(psi))
+                        process.WaitForExit();
+                }
+
+                UpdateComponentStatus(componentName, "✓ Completed", 100);
+                LogActivity("Fonts: Installation completed");
+            }
+            catch (Exception ex)
+            {
+                string errMsg = ex.Message;
+                if (ex.InnerException != null)
+                    errMsg += " → " + ex.InnerException.Message;
+                UpdateComponentStatus(componentName, "⚠ " + errMsg, 0);
+                LogActivity("Fonts: FAILED - " + errMsg);
+                LogActivity("Fonts: Stack trace: " + ex.StackTrace, true);
+            }
+            
+            return Task.FromResult(versions);
+        }
+
+        // Wrapper methods for new parallel structure
+        private async Task<Dictionary<string, string>> InstallPowerShell7Async(System.Threading.CancellationToken cancellationToken)
+        {
+            var versions = await InstallPowerShell7CoreAsync(cancellationToken);
+            if (cancellationToken.IsCancellationRequested || pwsh7Failed || !versions.ContainsKey("PWSH7_VERSION"))
+                return versions;
+
+            var addonVersions = await InstallPowerShell7AddonsAsync(cancellationToken);
+            foreach (var kvp in addonVersions)
+                versions[kvp.Key] = kvp.Value;
+
+            return versions;
+        }
+
+        private async Task<Dictionary<string, string>> InstallVSCodeFlowAsync(System.Threading.CancellationToken cancellationToken)
+        {
+            var versions = await InstallVSCodeCoreAsync(cancellationToken);
+            if (cancellationToken.IsCancellationRequested || !versions.ContainsKey("VSCODE_VERSION"))
+                return versions;
+
+            var extensionVersions = await InstallVSCodeExtensionsAsync(cancellationToken);
+            foreach (var kvp in extensionVersions)
+                versions[kvp.Key] = kvp.Value;
+
+            return versions;
+        }
+
+        private async Task<Dictionary<string, string>> InstallPowerShell7CoreAsync(System.Threading.CancellationToken cancellationToken)
+        {
+            var versions = new Dictionary<string, string>();
+            
+            // Check for cancellation
+            if (cancellationToken.IsCancellationRequested)
+            {
+                LogActivity("PowerShell 7: Installation cancelled");
+                return versions;
+            }
+            
+            // STEP 1: Install PowerShell 7 core first (MUST complete before modules)
+            LogActivity("PowerShell 7: Installing core...");
+            var pwshResult = await InstallPowerShell7(cancellationToken);
+            
+            // Check if installation failed
+            if (string.IsNullOrEmpty(pwshResult.Value))
+            {
+                LogActivity("PowerShell 7: Installation failed - will allow retry after other components");
+                UpdateComponentStatus("PowerShell 7", "⚠ Failed (will retry)", 0);
+                pwsh7Failed = true;
+                return versions;
+            }
+            
+            versions[pwshResult.Key] = pwshResult.Value;
+            LogActivity("PowerShell 7: Core installation completed - version " + pwshResult.Value);
+            
+            // Verify PowerShell 7 is installed (optimized polling)
+            string pwshExe = Path.Combine(installDir, "data", "lib", "pwsh", "pwsh.exe");
+            int retries = 0;
+            while (!File.Exists(pwshExe) && retries < 20 && !cancellationToken.IsCancellationRequested)
+            {
+                if (retries == 0)
+                    LogActivity("PowerShell 7: Verifying installation...");
+                else if (retries % 5 == 0)
+                    LogActivity("PowerShell 7: Still waiting for pwsh.exe... (" + (retries * 200) + "ms)");
+                await Task.Delay(200);  // Check every 200ms instead of 2000ms
+                retries++;
+            }
+            
+            if (!File.Exists(pwshExe))
+            {
+                LogActivity("PowerShell 7: CRITICAL ERROR - pwsh.exe not found at: " + pwshExe);
+                LogActivity("PowerShell 7: Installation verification failed - will allow retry after other components");
+                UpdateComponentStatus("PowerShell 7", "⚠ Failed (will retry)", 0);
+                pwsh7Failed = true;
+                return versions;
+            }
+            
+            LogActivity("PowerShell 7: pwsh.exe verified successfully");
+            UpdateComponentStatus("PowerShell 7", "Core installed", 60);
+            
+            return versions;
+        }
+
+        private async Task<Dictionary<string, string>> InstallPowerShell7AddonsAsync(System.Threading.CancellationToken cancellationToken)
+        {
+            var versions = new Dictionary<string, string>();
+
+            if (cancellationToken.IsCancellationRequested)
+            {
+                LogActivity("PowerShell 7: Installation cancelled before addons");
+                return versions;
+            }
+
+            string pwshExe = Path.Combine(installDir, "data", "lib", "pwsh", "pwsh.exe");
+            if (!File.Exists(pwshExe))
+            {
+                LogActivity("PowerShell 7: Addons skipped - pwsh.exe not found");
+                return versions;
+            }
+
+            LogActivity("PowerShell 7: Starting modules and Oh My Posh in parallel...");
+            UpdateComponentStatus("PowerShell 7", "Installing modules...", 60);
+
+            var parallelTasks = new List<Task<KeyValuePair<string, string>>>();
+
+            parallelTasks.Add(InstallOhMyPosh(cancellationToken));
+            parallelTasks.Add(InstallModule("Terminal-Icons", "TERMINAL_ICONS_VERSION", cancellationToken));
+            parallelTasks.Add(InstallModule("PSFzf", "PSFZF_VERSION", cancellationToken));
+            parallelTasks.Add(InstallModule("modern-unix-win", "MODERN_UNIX_WIN_VERSION", cancellationToken));
+
+            int completedTasks = 0;
+            int totalTasks = parallelTasks.Count;
+            var runningTasks = new List<Task<KeyValuePair<string, string>>>(parallelTasks);
+
+            while (runningTasks.Count > 0)
+            {
+                var completed = await Task.WhenAny(runningTasks);
+                runningTasks.Remove(completed);
+                completedTasks++;
+
+                int progress = 60 + (30 * completedTasks / totalTasks);
+                UpdateComponentStatus("PowerShell 7", "Installing modules... (" + completedTasks + "/" + totalTasks + ")", progress);
+
+                var result = await completed;
+                LogActivity("PowerShell 7: Received version info - " + result.Key + " = " + result.Value);
+                if (!string.IsNullOrEmpty(result.Value))
+                    versions[result.Key] = result.Value;
+            }
+            
+            LogActivity("PowerShell 7: All modules and Oh My Posh installed");
+            
+            // STEP 3: Install Oh My Posh theme after Oh My Posh is ready
+            UpdateComponentStatus("PowerShell 7", "Installing theme...", 95);
+            await InstallOhMyPoshTheme();
+            
+            // STEP 4: Create PowerShell profile
+            UpdateComponentStatus("PowerShell 7", "Creating profile...", 98);
+            await CreatePowerShellProfile();
+            
+            // Mark PowerShell 7 as 100% complete
+            UpdateComponentStatus("PowerShell 7", "✓ Completed", 100);
+            LogActivity("PowerShell 7: All components installed");
+            
+            return versions;
+        }
+
+        private async Task<Dictionary<string, string>> InstallVSCodeCoreAsync(System.Threading.CancellationToken cancellationToken)
+        {
+            var versions = new Dictionary<string, string>();
+            string componentName = "VSCode";
+            
+            // Check for cancellation
+            if (cancellationToken.IsCancellationRequested)
+            {
+                LogActivity("VSCode: Installation cancelled");
+                return versions;
+            }
+            
+            try
+            {
+                UpdateComponentStatus(componentName, "Checking version...", 5);
+                LogActivity("VSCode: Checking latest version...");
+
+                string version = "";
+                string downloadUrl = "";
+
+                using (var versionClient = new HttpClient(new HttpClientHandler { AllowAutoRedirect = false }))
+                {
+                    versionClient.DefaultRequestHeaders.Add("User-Agent", "VSCode-Portable-Installer");
+                    versionClient.Timeout = TimeSpan.FromMinutes(15);
+
+                    var request = new HttpRequestMessage(HttpMethod.Head, "https://update.code.visualstudio.com/latest/win32-x64-archive/stable");
+                    using (var response = await versionClient.SendAsync(request, cancellationToken))
+                    {
+                        string location = "";
+                        if (response.StatusCode == System.Net.HttpStatusCode.Redirect ||
+                            response.StatusCode == System.Net.HttpStatusCode.MovedPermanently ||
+                            response.StatusCode == System.Net.HttpStatusCode.Found ||
+                            response.StatusCode == System.Net.HttpStatusCode.SeeOther ||
+                            response.StatusCode == System.Net.HttpStatusCode.TemporaryRedirect)
+                        {
+                            location = response.Headers.Location != null ? response.Headers.Location.ToString() : "";
+                        }
+
+                        var match = Regex.Match(location, @"VSCode-win32-x64-([\d\.]+)\.zip");
+                        if (!match.Success)
+                        {
+                            vscodeDownloadCompleted = true;
+                            UpdateComponentStatus(componentName, "⚠ Version not found", 0);
+                            LogActivity("VSCode: Could not determine version from redirect");
+                            return versions;
+                        }
+
+                        version = match.Groups[1].Value;
+                        downloadUrl = "https://update.code.visualstudio.com/" + version + "/win32-x64-archive/stable";
+                        LogActivity("VSCode: Version = " + version);
+                    }
+                }
+
+                string tempDir = Path.Combine(Path.GetTempPath(), "vscode-pvs-install", "vscode");
+                // Clean up temp dir - if locked, use a new unique path
+                if (Directory.Exists(tempDir))
+                {
+                    try { Directory.Delete(tempDir, true); }
+                    catch
+                    {
+                        tempDir = Path.Combine(Path.GetTempPath(), "vscode-pvs-install", "vscode-" + DateTime.Now.Ticks);
+                        LogActivity("VSCode: Previous temp locked, using: " + tempDir);
+                    }
+                }
+                Directory.CreateDirectory(tempDir);
+                string zipPath = Path.Combine(tempDir, "vscode.zip");
+
+                UpdateComponentStatus(componentName, "Downloading...", 10);
+                LogActivity("VSCode: Downloading version " + version + "...");
+
+                using (var client = new HttpClient())
+                {
+                    client.Timeout = TimeSpan.FromMinutes(MAX_DOWNLOAD_TIMEOUT_MINUTES);
+                    client.DefaultRequestHeaders.ConnectionClose = false;
+                    client.DefaultRequestHeaders.Add("User-Agent", "VSCode-Portable-Installer");
+                    await DownloadFileWithProgress(client, downloadUrl, zipPath, componentName, 10, 55, cancellationToken);
+                }
+
+                if (!File.Exists(zipPath) || new FileInfo(zipPath).Length < 1000000)
+                {
+                    vscodeDownloadCompleted = true;
+                    LogActivity("VSCode: Download file missing or too small (" + (File.Exists(zipPath) ? new FileInfo(zipPath).Length + " bytes" : "not found") + ")");
+                    UpdateComponentStatus(componentName, "⚠ Download failed (file too small)", 0);
+                    return versions;
+                }
+
+                vscodeDownloadCompleted = true;
+                LogActivity("VSCode: Download completed (" + (new FileInfo(zipPath).Length / 1048576) + " MB)");
+                UpdateComponentStatus(componentName, "Extracting...", 56);
+                LogActivity("VSCode: Extracting directly to target directory...");
+                
+                // Extract directly to target directory (no intermediate copy)
+                await ExtractZipWithProgress(zipPath, installDir, componentName, 56, 74, cancellationToken);
+
+                LogActivity("VSCode: Extraction completed");
+                UpdateComponentStatus(componentName, "Creating settings...", 76);
+                LogActivity("VSCode: Creating settings.json...");
+                await CreateVSCodeSettings();
+                LogActivity("VSCode: Settings created");
+
+                UpdateComponentStatus(componentName, "Finalizing...", 79);
+                LogActivity("VSCode: Skipping recursive unblock (streamed extraction produces local files)");
+
+                if (Directory.Exists(tempDir))
+                    Directory.Delete(tempDir, true);
+
+                UpdateComponentStatus(componentName, "Core installed", 80);
+                LogActivity("VSCode: Core installation completed");
+                versions["VSCODE_VERSION"] = version;
+            }
+            catch (Exception ex)
+            {
+                vscodeDownloadCompleted = true;
+                string errMsg = ex.Message;
+                if (ex.InnerException != null)
+                    errMsg += " → " + ex.InnerException.Message;
+                UpdateComponentStatus(componentName, "⚠ " + errMsg, 0);
+                LogActivity("VSCode: FAILED - " + errMsg);
+                LogActivity("VSCode: Stack trace: " + ex.StackTrace, true);
+            }
+
+            return versions;
+        }
+
+        private async Task<Dictionary<string, string>> InstallVSCodeExtensionsAsync(System.Threading.CancellationToken cancellationToken)
+        {
+            var versions = new Dictionary<string, string>();
+
+            if (cancellationToken.IsCancellationRequested)
+            {
+                LogActivity("VSCode: Extension installation cancelled");
+                return versions;
+            }
+
+            UpdateComponentStatus("VSCode", "Installing extensions...", 80);
+            await InstallVSCodeExtensions("VSCode");
+            UpdateComponentStatus("VSCode", "✓ Completed", 100);
+            LogActivity("VSCode: Installation completed");
+
+            return versions;
+        }
+
+        private async Task<Dictionary<string, string>> InstallPythonCoreAsync(System.Threading.CancellationToken cancellationToken)
+        {
+            var baseVersions = await InstallPythonBaseAsync(cancellationToken);
+            if (cancellationToken.IsCancellationRequested || !baseVersions.ContainsKey("PYTHON_BASE_VERSION"))
+                return new Dictionary<string, string>();
+
+            return await InstallPythonPipAsync(baseVersions["PYTHON_BASE_VERSION"], cancellationToken, false);
+        }
+
+        private async Task<Dictionary<string, string>> InstallPythonBaseAsync(System.Threading.CancellationToken cancellationToken)
+        {
+            var versions = new Dictionary<string, string>();
+            string componentName = "Python";
+
+            if (cancellationToken.IsCancellationRequested)
+            {
+                LogActivity("Python: Installation cancelled");
+                return versions;
+            }
+
+            try
+            {
+                UpdateComponentStatus(componentName, "Checking version...", 5);
+                LogActivity("Python: Checking version...");
+
+                string requestedVersion = string.IsNullOrEmpty(pythonVersionInput) ? "latest" : pythonVersionInput;
+                UpdateComponentStatus(componentName, "Requesting: " + requestedVersion, 7);
+
+                string version = await GetLatestPythonVersion(requestedVersion);
+                if (string.IsNullOrEmpty(version))
+                {
+                    UpdateComponentStatus(componentName, "⚠ Version not found: " + requestedVersion, 0);
+                    return versions;
+                }
+
+                Invoke(new Action(() =>
+                {
+                    if (pythonVersionTextBox != null)
+                        pythonVersionTextBox.Text = version;
+                }));
+
+                UpdateComponentStatus(componentName, "Found: " + version, 9);
+                LogActivity("Python: Found version " + version);
+                UpdateComponentStatus(componentName, "Downloading...", 10);
+                LogActivity("Python: Downloading embeddable package...");
+                string url = PYTHON_FTP_BASE + version + "/python-" + version + "-embed-amd64.zip";
+
+                string tempDir = Path.Combine(Path.GetTempPath(), TEMP_INSTALL_DIR, "python");
+                if (Directory.Exists(tempDir))
+                    Directory.Delete(tempDir, true);
+                Directory.CreateDirectory(tempDir);
+                string zipPath = Path.Combine(tempDir, "python.zip");
+
+                using (var client = new HttpClient())
+                {
+                    client.Timeout = TimeSpan.FromMinutes(MAX_DOWNLOAD_TIMEOUT_MINUTES);
+                    client.DefaultRequestHeaders.ConnectionClose = false;
+                    await DownloadFileWithProgress(client, url, zipPath, componentName, 10, 60, cancellationToken);
+                }
+
+                if (!File.Exists(zipPath))
+                {
+                    UpdateComponentStatus(componentName, "⚠ Download failed", 0);
+                    return versions;
+                }
+
+                UpdateComponentStatus(componentName, "Extracting...", 65);
+                LogActivity("Python: Extracting directly to target directory...");
+                string pythonDir = Path.Combine(installDir, "data", "lib", "python");
+                if (Directory.Exists(pythonDir))
+                    Directory.Delete(pythonDir, true);
+                Directory.CreateDirectory(pythonDir);
+
+                await ExtractZipWithProgress(zipPath, pythonDir, componentName, 65, 90, cancellationToken);
+
+                UpdateComponentStatus(componentName, "Configuring...", 92);
+
+                string shortVer = version.Replace(".", "");
+                if (shortVer.Length > 3)
+                    shortVer = shortVer.Substring(0, 3);
+
+                string pthFile = Path.Combine(pythonDir, "python" + shortVer + "._pth");
+                if (File.Exists(pthFile))
+                {
+                    string newPthFile = Path.Combine(pythonDir, "__python" + shortVer + "._pth");
+                    File.Move(pthFile, newPthFile);
+                }
+
+                string pythonExe = Path.Combine(pythonDir, "python.exe");
+                if (!File.Exists(pythonExe))
+                {
+                    UpdateComponentStatus(componentName, "⚠ python.exe not found", 0);
+                    LogActivity("Python: FAILED - python.exe not found after extraction");
+                    return versions;
+                }
+
+                if (Directory.Exists(tempDir))
+                    Directory.Delete(tempDir, true);
+
+                UpdateComponentStatus(componentName, "Base installed", 93);
+                LogActivity("Python: Base installation completed (v" + version + ")");
+                versions["PYTHON_BASE_VERSION"] = version;
+            }
+            catch (Exception ex)
+            {
+                string errMsg = ex.Message;
+                if (ex.InnerException != null)
+                    errMsg += " → " + ex.InnerException.Message;
+                UpdateComponentStatus(componentName, "⚠ " + errMsg, 0);
+                LogActivity("Python: FAILED - " + errMsg);
+                LogActivity("Python: Stack trace: " + ex.StackTrace, true);
+            }
+
+            return versions;
+        }
+
+        private async Task<Dictionary<string, string>> InstallPythonPipAsync(string version, System.Threading.CancellationToken cancellationToken, bool waitForVSCodeDownload)
+        {
+            var versions = new Dictionary<string, string>();
+            string componentName = "Python";
+
+            if (cancellationToken.IsCancellationRequested)
+            {
+                LogActivity("Python: Installation cancelled before pip bootstrap");
+                return versions;
+            }
+
+            string pythonDir = Path.Combine(installDir, "data", "lib", "python");
+            string pythonExe = Path.Combine(pythonDir, "python.exe");
+            if (!File.Exists(pythonExe))
+            {
+                UpdateComponentStatus(componentName, "⚠ python.exe not found", 0);
+                LogActivity("Python: FAILED - python.exe not found at: " + pythonExe);
+                return versions;
+            }
+
+            try
+            {
+                if (waitForVSCodeDownload && !vscodeDownloadCompleted)
+                {
+                    UpdateComponentStatus(componentName, "Waiting for VSCode download...", 93);
+                    LogActivity("Python: Waiting for VSCode download to finish before installing pip...");
+
+                    int waitIterations = 0;
+                    while (!vscodeDownloadCompleted && !cancellationToken.IsCancellationRequested && waitIterations < 360)
+                    {
+                        await Task.Delay(500, cancellationToken);
+                        waitIterations++;
+                    }
+
+                    if (vscodeDownloadCompleted)
+                        LogActivity("Python: VSCode download finished; continuing pip bootstrap");
+                    else if (!cancellationToken.IsCancellationRequested)
+                        LogActivity("Python: VSCode download wait timed out; continuing pip bootstrap");
+                }
+
+                UpdateComponentStatus(componentName, "Installing pip...", 94);
+                LogActivity("Python: Installing pip...");
+
+                string pipTempDir = Path.Combine(Path.GetTempPath(), TEMP_INSTALL_DIR, "pip");
+                if (Directory.Exists(pipTempDir))
+                    Directory.Delete(pipTempDir, true);
+                Directory.CreateDirectory(pipTempDir);
+
+                string getPipPath = Path.Combine(pipTempDir, "get-pip.py");
+
+                using (var client = new HttpClient())
+                {
+                    client.Timeout = TimeSpan.FromMinutes(MAX_DOWNLOAD_TIMEOUT_MINUTES);
+                    client.DefaultRequestHeaders.ConnectionClose = false;
+                    var getPipContent = await client.GetStringAsync(BOOTSTRAP_PIP_URL);
+                    File.WriteAllText(getPipPath, getPipContent, Encoding.UTF8);
+                }
+
+                UpdateComponentStatus(componentName, "Running get-pip.py...", 96);
+
+                if (File.Exists(getPipPath))
+                {
+                    var psi = new ProcessStartInfo
+                    {
+                        FileName = pythonExe,
+                        Arguments = "\"" + getPipPath + "\" --no-warn-script-location",
+                        UseShellExecute = false,
+                        CreateNoWindow = true,
+                        WorkingDirectory = pipTempDir,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true
+                    };
+
+                    using (var process = Process.Start(psi))
+                    {
+                        process.WaitForExit(120000);
+                    }
+
+                    UpdateComponentStatus(componentName, "Cleaning Scripts...", 97);
+
+                    string scriptsDir = Path.Combine(pythonDir, "Scripts");
+                    if (Directory.Exists(scriptsDir))
+                    {
+                        foreach (var exeFile in Directory.GetFiles(scriptsDir, "*.exe"))
+                        {
+                            try { File.Delete(exeFile); } catch { }
+                        }
+                    }
+
+                    UpdateComponentStatus(componentName, "Creating pip.cmd...", 98);
+
+                    string pipCmd = Path.Combine(pythonDir, "pip.cmd");
+                    string pipCmdContent = "@echo off\r\n\"%~dp0python.exe\" -m pip %*\r\n";
+                    File.WriteAllText(pipCmd, pipCmdContent, Encoding.ASCII);
+                    LogActivity("Python: pip.cmd created");
+                }
+
+                if (Directory.Exists(pipTempDir))
+                    Directory.Delete(pipTempDir, true);
+
+                UpdateComponentStatus(componentName, "✓ Completed", 100);
+                LogActivity("Python: Installation completed (v" + version + ")");
+                versions["PYTHON_VERSION"] = version;
+            }
+            catch (Exception ex)
+            {
+                string errMsg = ex.Message;
+                if (ex.InnerException != null)
+                    errMsg += " → " + ex.InnerException.Message;
+                UpdateComponentStatus(componentName, "⚠ " + errMsg, 0);
+                LogActivity("Python: FAILED - " + errMsg);
+                LogActivity("Python: Stack trace: " + ex.StackTrace, true);
+            }
+
+            return versions;
+        }
+
+        private async Task<KeyValuePair<string, string>> InstallPowerShell7(System.Threading.CancellationToken cancellationToken)
+        {
+            var installer = new PowerShellInstaller(
+                installDir,
+                (name, status, progress) =>
+                {
+                    if (name == "PowerShell 7")
+                    {
+                        int mappedProgress = (int)Math.Round(progress * 0.60);
+                        UpdateComponentStatus(name, status, mappedProgress);
+                    }
+                    else
+                    {
+                        UpdateComponentStatus(name, status, progress);
+                    }
+                },
+                (message) => LogActivity(message)
+            );
+
+            return await installer.InstallAsync(Path.Combine(Path.GetTempPath(), TEMP_INSTALL_DIR), false);
+        }
+
+        private async Task<KeyValuePair<string, string>> InstallOhMyPosh(System.Threading.CancellationToken cancellationToken)
+        {
+            var installer = new OhMyPoshInstaller(
+                installDir,
+                (name, status, progress) => UpdateComponentStatus(name, status, progress),
+                (message) => LogActivity(message)
+            );
+
+            return await installer.InstallAsync(Path.Combine(Path.GetTempPath(), TEMP_INSTALL_DIR));
+        }
+
+        private string GetOhMyPoshVersion(string exePath)
+        {
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = exePath,
+                    Arguments = "--version",
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true
+                };
+
+                using (var process = Process.Start(psi))
+                {
+                    if (process.WaitForExit(5000))
+                    {
+                        return process.StandardOutput.ReadToEnd().Trim();
+                    }
+                }
+            }
+            catch { }
+            return "";
+        }
+
+        private async Task<KeyValuePair<string, string>> InstallModule(string moduleName, string versionKey, System.Threading.CancellationToken cancellationToken)
+        {
+            var installer = new ModuleInstaller(
+                installDir,
+                (name, status, progress) => UpdateComponentStatus(name, status, progress),
+                (message) => LogActivity(message)
+            );
+
+            return await installer.InstallModuleAsync(moduleName, versionKey);
+        }
+
+        private async Task InstallOhMyPoshTheme()
+        {
+            try
+            {
+                string pwshOmpDir = Path.Combine(installDir, "data", "lib", "pwsh", "ohmyposh");
+                Directory.CreateDirectory(pwshOmpDir);
+                string themesDir = Path.Combine(pwshOmpDir, "themes");
+                Directory.CreateDirectory(themesDir);
+
+                string themeContent = ReadEmbeddedResource("tos-term.omp.json");
+                if (!string.IsNullOrEmpty(themeContent))
+                {
+                    // Create actual theme (original)
+                    string themePath = Path.Combine(themesDir, "tos-term.omp.json");
+                    File.WriteAllText(themePath, themeContent, Encoding.UTF8);
+                    LogActivity("Oh My Posh: Theme installed");
+                    
+                    // Create origin backup (copy)
+                    string originDir = Path.Combine(installDir, "data", "lib", "origin");
+                    Directory.CreateDirectory(originDir);
+                    string originPath = Path.Combine(originDir, "tos-term.omp.json");
+                    File.WriteAllText(originPath, themeContent, Encoding.UTF8);
+                }
+                
+                await Task.CompletedTask;
+            }
+            catch { }
+        }
+
+        private async Task CreatePowerShellProfile()
+        {
+            try
+            {
+                string profileContent = ReadEmbeddedResource("Microsoft.PowerShell_profile.ps1");
+                if (profileContent != null)
+                {
+                    // Create actual profile (original)
+                    string profilePath = Path.Combine(installDir, "data", "lib", "pwsh", "Microsoft.PowerShell_profile.ps1");
+                    File.WriteAllText(profilePath, profileContent, Encoding.UTF8);
+                    
+                    // Create origin backup (copy)
+                    string originDir = Path.Combine(installDir, "data", "lib", "origin");
+                    Directory.CreateDirectory(originDir);
+                    string originPath = Path.Combine(originDir, "Microsoft.PowerShell_profile.ps1");
+                    File.WriteAllText(originPath, profileContent, Encoding.UTF8);
+                }
+                await Task.CompletedTask;
+            }
+            catch { }
+        }
+
+        private async Task InstallVSCodeExtensions(string componentName)
+        {
+            try
+            {
+                LogActivity("VSCode: Installing extensions in batch with retry...");
+
+                string codeExe = Path.Combine(installDir, "Code.exe");
+                string cliJs = Path.Combine(installDir, "resources", "app", "out", "cli.js");
+
+                if (!File.Exists(codeExe))
+                {
+                    var codeCandidates = Directory.GetFiles(installDir, "Code.exe", SearchOption.AllDirectories);
+                    if (codeCandidates.Length > 0)
+                        codeExe = codeCandidates[0];
+                }
+
+                if (!File.Exists(cliJs))
+                {
+                    var cliCandidates = Directory.GetFiles(installDir, "cli.js", SearchOption.AllDirectories)
+                        .Where(p => p.EndsWith(Path.Combine("resources", "app", "out", "cli.js"), StringComparison.OrdinalIgnoreCase))
+                        .ToArray();
+                    if (cliCandidates.Length > 0)
+                        cliJs = cliCandidates[0];
+                }
+
+                if (!File.Exists(codeExe) || !File.Exists(cliJs))
+                {
+                    LogActivity("VSCode: CLI tools not found, skipping extensions");
+                    return;
+                }
+
+                LogActivity("VSCode: CLI detected -- Code=" + codeExe + ", cli.js=" + cliJs);
+
+                // Use absolute paths to avoid resolution issues
+                string extensionsDir = Path.Combine(installDir, "data", "extensions");
+                string userDataDir = Path.Combine(installDir, "data", "user-data");
+
+                Directory.CreateDirectory(extensionsDir);
+                Directory.CreateDirectory(userDataDir);
+
+                var extensions = new List<string>
+                {
+                    "teabyii.ayu",
+                    "zhuangtongfa.material-theme",
+                    "ms-python.python",
+                    "ms-toolsai.jupyter",
+                    "ms-vscode-remote.remote-ssh",
+                    "KevinRose.vsc-python-indent",
+                    "usernamehw.errorlens",
+                    "Gerrnperl.outline-map"
+                };
+
+                // Brief wait for file system to settle after VSCode extraction
+                await Task.Delay(300);
+
+                int installed = 0;
+                int total = extensions.Count;
+                var failedExtensions = new List<string>();
+                UpdateComponentStatus(componentName, "Installing extensions (batch)...", 82);
+                LogActivity("VSCode: Starting batch install for " + total + " extension(s)...");
+
+                string batchArguments = BuildVSCodeExtensionInstallArguments(cliJs, extensionsDir, userDataDir, extensions);
+                var batchResult = await RunVSCodeCliProcess(codeExe, batchArguments, 600000);
+                if (!batchResult.Item4)
+                {
+                    LogActivity("VSCode: Batch install timed out; missing extensions will be retried individually");
+                }
+                else if (batchResult.Item1 != 0)
+                {
+                    string errSnip = string.IsNullOrEmpty(batchResult.Item3) ? "" : " -- " + batchResult.Item3.Substring(0, Math.Min(160, batchResult.Item3.Length)).Trim();
+                    LogActivity("VSCode: Batch install exited with code " + batchResult.Item1 + errSnip);
+                }
+
+                foreach (var ext in extensions)
+                {
+                    bool success = IsVSCodeExtensionInstalled(extensionsDir, ext);
+                    if (!success)
+                        failedExtensions.Add(ext);
+
+                    installed++;
+                    int progress = 80 + (int)(16.0 * installed / total);
+                    UpdateComponentStatus(componentName, "Installing extensions (" + installed + "/" + total + ")...", progress);
+                    LogActivity("VSCode: [" + installed + "/" + total + "] " + ext + (success ? " OK" : " PENDING RETRY"));
+                }
+
+                // Final retry pass for failed extensions after network recovery delay
+                if (failedExtensions.Count > 0)
+                {
+                    LogActivity("VSCode: Retrying " + failedExtensions.Count + " missing extension(s)...");
+                    await Task.Delay(1500);
+
+                    var stillFailed = new List<string>();
+                    foreach (var ext in failedExtensions)
+                    {
+                        bool success = false;
+
+                        try
+                        {
+                            LogActivity("VSCode: Final retry -- " + ext + "...");
+
+                            string retryArguments = BuildVSCodeExtensionInstallArguments(cliJs, extensionsDir, userDataDir, new[] { ext });
+                            var retryResult = await RunVSCodeCliProcess(codeExe, retryArguments, 600000);
+                            bool isInstalled = IsVSCodeExtensionInstalled(extensionsDir, ext);
+
+                            if (isInstalled || (retryResult.Item4 && retryResult.Item1 == 0))
+                            {
+                                success = true;
+                                LogActivity("VSCode: Final retry -- " + ext + " OK");
+                            }
+                            else
+                            {
+                                LogActivity("VSCode: Final retry -- " + ext + " FAILED");
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            LogActivity("VSCode: Final retry exception for " + ext + " -- " + ex.Message);
+                        }
+
+                        if (!success)
+                            stillFailed.Add(ext);
+
+                        await Task.Delay(300);
+                    }
+
+                    if (stillFailed.Count > 0)
+                    {
+                        LogActivity("VSCode: " + stillFailed.Count + " extension(s) could not be installed: " + string.Join(", ", stillFailed));
+                        LogActivity("VSCode: These can be installed manually from within VS Code");
+                    }
+                    else
+                    {
+                        LogActivity("VSCode: All previously failed extensions recovered successfully");
+                    }
+                }
+
+                LogActivity("VSCode: All extensions processed (" + installed + "/" + total + ")");
+
+                // Remove extensions.json so VSCode regenerates it cleanly on first launch
+                string extensionsJsonPath = Path.Combine(extensionsDir, "extensions.json");
+                if (File.Exists(extensionsJsonPath))
+                {
+                    try { File.Delete(extensionsJsonPath); } catch { }
+                }
+            }
+            catch (Exception ex)
+            {
+                LogActivity("VSCode: Extension installation error -- " + ex.Message);
+            }
+        }
+
+        private string BuildVSCodeExtensionInstallArguments(string cliJs, string extensionsDir, string userDataDir, IEnumerable<string> extensions)
+        {
+            var args = new StringBuilder();
+            args.Append("\"").Append(cliJs).Append("\"");
+            args.Append(" --extensions-dir \"").Append(extensionsDir).Append("\"");
+            args.Append(" --user-data-dir \"").Append(userDataDir).Append("\"");
+
+            foreach (var ext in extensions)
+                args.Append(" --install-extension ").Append(ext);
+
+            args.Append(" --force");
+            return args.ToString();
+        }
+
+        private bool IsVSCodeExtensionInstalled(string extensionsDir, string extensionId)
+        {
+            return Directory.GetDirectories(extensionsDir)
+                .Any(d => Path.GetFileName(d).StartsWith(extensionId + "-", StringComparison.OrdinalIgnoreCase));
+        }
+
+        private async Task<Tuple<int, string, string, bool>> RunVSCodeCliProcess(string codeExe, string arguments, int timeoutMs)
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = codeExe,
+                Arguments = arguments,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                WorkingDirectory = installDir
+            };
+
+            psi.EnvironmentVariables["ELECTRON_RUN_AS_NODE"] = "1";
+            psi.EnvironmentVariables["VSCODE_DEV"] = "";
+
+            using (var process = Process.Start(psi))
+            {
+                var outputTask = process.StandardOutput.ReadToEndAsync();
+                var errorTask = process.StandardError.ReadToEndAsync();
+
+                bool finished = await Task.Run(() => process.WaitForExit(timeoutMs));
+                if (!finished)
+                {
+                    try { process.Kill(); } catch { }
+                }
+
+                string output = await outputTask;
+                string error = await errorTask;
+                int exitCode = finished ? process.ExitCode : -1;
+                return Tuple.Create(exitCode, output, error, finished);
+            }
+        }
+
+        private async Task CreateVSCodeSettings()
+        {
+            try
+            {
+                string settingsContent = ReadEmbeddedResource("settings.json");
+                if (settingsContent != null)
+                {
+                    // Create actual settings (original)
+                    string settingsDir = Path.Combine(installDir, "data", "user-data", "User");
+                    Directory.CreateDirectory(settingsDir);
+                    string settingsPath = Path.Combine(settingsDir, "settings.json");
+                    File.WriteAllText(settingsPath, settingsContent, Encoding.UTF8);
+                    
+                    // Create origin backup (copy)
+                    string originDir = Path.Combine(installDir, "data", "lib", "origin");
+                    Directory.CreateDirectory(originDir);
+                    string originPath = Path.Combine(originDir, "settings.json");
+                    File.WriteAllText(originPath, settingsContent, Encoding.UTF8);
+                }
+                await Task.CompletedTask;
+            }
+            catch { }
+        }
+
+        private async Task<string> GetLatestPythonVersion(string majorMinor)
+        {
+            try
+            {
+                LogActivity("Python: Fetching version info from python.org...");
+                
+                // Enable TLS 1.2
+                System.Net.ServicePointManager.SecurityProtocol = (System.Net.SecurityProtocolType)3072;
+                
+                // Download HTML content with automatic decompression
+                string p;
+                var handler = new HttpClientHandler
+                {
+                    AutomaticDecompression = System.Net.DecompressionMethods.GZip | System.Net.DecompressionMethods.Deflate
+                };
+                
+                using (var client = new HttpClient(handler))
+                {
+                    client.Timeout = TimeSpan.FromSeconds(30); // 30 second timeout
+                    client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
+                    p = await client.GetStringAsync(PYTHON_DOWNLOADS_URL);
+                }
+                
+                LogActivity("Python: Downloaded version info page (" + p.Length + " bytes)");
+
+                // Split into lines
+                var lines = p.Split('\n');
+
+                if (majorMinor == "latest" || string.IsNullOrEmpty(majorMinor))
+                {
+                    LogActivity("Python: Looking for latest Python 3 release...");
+                    // Find "Latest Python 3 Release"
+                    foreach (var line in lines)
+                    {
+                        if (line.Contains("Latest Python 3 Release"))
+                        {
+                            var match = Regex.Match(line, @"(\d+\.\d+\.\d+)");
+                            if (match.Success)
+                            {
+                                string foundVersion = match.Groups[1].Value;
+                                LogActivity("Python: Found latest version " + foundVersion);
+                                return foundVersion;
+                            }
+                        }
+                    }
+                    LogActivity("Python: WARNING - Could not find latest Python 3 release in downloads page");
+                }
+                else
+                {
+                    LogActivity("Python: Looking for version " + majorMinor + "...");
+                    // Find specific version (e.g., 3.12)
+                    // PowerShell: $prefix = $LatestOnly + "\."
+                    var prefix = majorMinor + @"\.";
+                    // PowerShell: if ($line -match "Python\s+$prefix\d+")
+                    var pattern1 = @"Python\s+" + prefix + @"\d+";
+                    // PowerShell: if ($line -match "Python\s+($prefix\d+)")
+                    var pattern2 = @"Python\s+(" + prefix + @"\d+)";
+                    
+                    foreach (var line in lines)
+                    {
+                        if (Regex.IsMatch(line, pattern1))
+                        {
+                            var match = Regex.Match(line, pattern2);
+                            if (match.Success)
+                            {
+                                string foundVersion = match.Groups[1].Value;
+                                LogActivity("Python: Found version " + foundVersion);
+                                return foundVersion;
+                            }
+                        }
+                    }
+                    LogActivity("Python: WARNING - Version " + majorMinor + " not found in downloads page");
+                }
+            }
+            catch (Exception ex)
+            {
+                // Log error with full details
+                LogActivity("Python: ERROR fetching version info - " + ex.GetType().Name + ": " + ex.Message);
+                if (ex.InnerException != null)
+                    LogActivity("Python: Inner exception - " + ex.InnerException.Message);
+            }
+            
+            LogActivity("Python: Returning empty version (failed to detect)");
+            return "";
+        }
+
+        private async Task DownloadFileWithProgress(HttpClient client, string url, string destinationPath,
+            string componentName, int startProgress, int endProgress, System.Threading.CancellationToken cancellationToken)
+        {
+            using (var response = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancellationToken))
+            {
+                response.EnsureSuccessStatusCode();
+
+                var totalBytes = response.Content.Headers.ContentLength;
+                var canReportProgress = totalBytes.HasValue;
+
+                using (var contentStream = await response.Content.ReadAsStreamAsync())
+                using (var fileStream = new FileStream(destinationPath, FileMode.Create, FileAccess.Write, FileShare.None, DOWNLOAD_BUFFER_SIZE, true))
+                {
+                    var buffer = new byte[DOWNLOAD_BUFFER_SIZE];
+                    long totalRead = 0;
+                    int bytesRead;
+                    var lastReportedProgress = startProgress;
+                    var lastLoggedPercentage = 0;
+
+                    // Progress simulation task for downloads without Content-Length
+                    Task progressTask = null;
+                    var progressCancellation = new System.Threading.CancellationTokenSource();
+
+                    if (!canReportProgress)
+                    {
+                        progressTask = Task.Run(async () =>
+                        {
+                            int progress = startProgress;
+                            int maxProgress = startProgress + (int)((endProgress - startProgress) * 0.85);
+                            while (!progressCancellation.Token.IsCancellationRequested && progress < maxProgress)
+                            {
+                                await Task.Delay(800); // Faster progress updates
+                                progress += 3;
+                                if (!progressCancellation.Token.IsCancellationRequested && progress < maxProgress)
+                                {
+                                    var downloadedMB = totalRead / 1048576.0;
+                                    var status = string.Format("Downloading... {0:F1} MB", downloadedMB);
+                                    UpdateComponentStatus(componentName, status, Math.Min(progress, maxProgress));
+                                }
+                            }
+                        }, progressCancellation.Token);
+                    }
+
+                    while ((bytesRead = await contentStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken)) > 0)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        await fileStream.WriteAsync(buffer, 0, bytesRead, cancellationToken);
+                        totalRead += bytesRead;
+
+                        if (canReportProgress)
+                        {
+                            var progressPercentage = (int)((double)totalRead / totalBytes.Value * 100);
+                            var currentProgress = startProgress + (int)((endProgress - startProgress) * (progressPercentage / 100.0));
+
+                            if (currentProgress > lastReportedProgress)
+                            {
+                                var downloadedMB = totalRead / 1048576.0;
+                                var totalMB = totalBytes.Value / 1048576.0;
+                                var status = string.Format("Downloading... {0:F1}/{1:F1} MB", downloadedMB, totalMB);
+                                UpdateComponentStatus(componentName, status, currentProgress);
+
+                                // Log progress at 10% intervals for large downloads (file only - no UI overhead)
+                                if (progressPercentage % 10 == 0 && progressPercentage != lastLoggedPercentage)
+                                {
+                                    LogActivity(string.Format("{0}: Downloading... {1}% ({2:F1}/{3:F1} MB)",
+                                        componentName, progressPercentage, downloadedMB, totalMB), fileOnly: true);
+                                    lastLoggedPercentage = progressPercentage;
+                                }
+
+                                lastReportedProgress = currentProgress;
+                            }
+                        }
+                    }
+
+                    // Stop progress simulation
+                    if (progressTask != null)
+                    {
+                        progressCancellation.Cancel();
+                        try { await progressTask; } catch { }
+                    }
+                }
+            }
+        }
+
+        private async Task ExtractZipWithProgress(string zipPath, string extractPath,
+            string componentName, int startProgress, int endProgress, System.Threading.CancellationToken cancellationToken)
+        {
+            await Task.Run(() =>
+            {
+                using (var archive = ZipFile.OpenRead(zipPath))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    int totalEntries = archive.Entries.Count;
+                    int processedEntries = 0;
+                    int lastReportedProgress = startProgress;
+                    var extractionErrors = new List<string>();
+                    var errorLock = new object();
+
+                    var entries = archive.Entries.ToList();
+                    
+                    // Create base directory
+                    Directory.CreateDirectory(extractPath);
+                    
+                    // First pass: Create all directories
+                    foreach (var entry in entries.Where(e => string.IsNullOrEmpty(e.Name)))
+                    {
+                        string destPath = Path.Combine(extractPath, entry.FullName);
+                        try
+                        {
+                            Directory.CreateDirectory(destPath);
+                        }
+                        catch { }
+                    }
+
+                    // Second pass: Extract files
+                    var fileEntries = entries.Where(e => !string.IsNullOrEmpty(e.Name)).ToList();
+                    
+                    // Use parallel extraction for large archives (> 100 files), sequential for small ones
+                    if (fileEntries.Count > 100)
+                    {
+                        var lockObj = new object();
+                        
+                        // Extract to memory first, then write in parallel (thread-safe)
+                        System.Threading.Tasks.Parallel.ForEach(fileEntries, new System.Threading.Tasks.ParallelOptions { CancellationToken = cancellationToken }, entry =>
+                        {
+                            cancellationToken.ThrowIfCancellationRequested();
+                            try
+                            {
+                                byte[] buffer;
+                                
+                                // Read from archive with lock (ZipArchive is not thread-safe)
+                                lock (archive)
+                                {
+                                    using (var entryStream = entry.Open())
+                                    using (var ms = new System.IO.MemoryStream())
+                                    {
+                                        entryStream.CopyTo(ms, 131072); // 128KB buffer for faster extraction
+                                        buffer = ms.ToArray();
+                                    }
+                                }
+                                
+                                // Write to disk (can be done in parallel)
+                                string destPath = Path.Combine(extractPath, entry.FullName);
+                                string destDir = Path.GetDirectoryName(destPath);
+                                Directory.CreateDirectory(destDir);
+                                
+                                File.WriteAllBytes(destPath, buffer);
+
+                                lock (lockObj)
+                                {
+                                    processedEntries++;
+                                    var progressPercentage = (int)((double)processedEntries / totalEntries * 100);
+                                    var currentProgress = startProgress + (int)((endProgress - startProgress) * (progressPercentage / 100.0));
+
+                                    if (currentProgress > lastReportedProgress)
+                                    {
+                                        UpdateComponentStatus(componentName, "Extracting...", currentProgress);
+                                        lastReportedProgress = currentProgress;
+                                    }
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                LogActivity(componentName + ": Failed to extract " + entry.FullName + " - " + ex.Message);
+                                lock (errorLock)
+                                {
+                                    extractionErrors.Add(entry.FullName + ": " + ex.Message);
+                                }
+                            }
+                        });
+                    }
+                    else
+                    {
+                        // Sequential extraction for small archives
+                        foreach (var entry in fileEntries)
+                        {
+                            cancellationToken.ThrowIfCancellationRequested();
+                            try
+                            {
+                                string destPath = Path.Combine(extractPath, entry.FullName);
+                                string destDir = Path.GetDirectoryName(destPath);
+                                Directory.CreateDirectory(destDir);
+                                entry.ExtractToFile(destPath, true);
+
+                                processedEntries++;
+                                var progressPercentage = (int)((double)processedEntries / totalEntries * 100);
+                                var currentProgress = startProgress + (int)((endProgress - startProgress) * (progressPercentage / 100.0));
+
+                                if (currentProgress > lastReportedProgress)
+                                {
+                                    UpdateComponentStatus(componentName, "Extracting...", currentProgress);
+                                    lastReportedProgress = currentProgress;
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                LogActivity(componentName + ": Failed to extract " + entry.FullName + " - " + ex.Message);
+                                lock (errorLock)
+                                {
+                                    extractionErrors.Add(entry.FullName + ": " + ex.Message);
+                                }
+                            }
+                        }
+                    }
+
+                    if (extractionErrors.Count > 0)
+                    {
+                        throw new Exception(componentName + " extraction failed for " + extractionErrors.Count + " entries. First error: " + extractionErrors[0]);
+                    }
+                }
+            });
+        }
+
+        private void CopyDirectoryRecursive(string sourceDir, string targetDir, bool overwrite)
+        {
+            Directory.CreateDirectory(targetDir);
+
+            // Copy files in parallel for better performance
+            var files = Directory.GetFiles(sourceDir);
+            System.Threading.Tasks.Parallel.ForEach(files, file =>
+            {
+                string fileName = Path.GetFileName(file);
+                string destFile = Path.Combine(targetDir, fileName);
+                File.Copy(file, destFile, overwrite);
+            });
+
+            // Process subdirectories recursively
+            foreach (var dir in Directory.GetDirectories(sourceDir))
+            {
+                string dirName = Path.GetFileName(dir);
+                string destDir = Path.Combine(targetDir, dirName);
+                CopyDirectoryRecursive(dir, destDir, overwrite);
+            }
+        }
+
+        private void UnblockFiles(string directory)
+        {
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "powershell",
+                    Arguments = "-NoProfile -Command \"Get-ChildItem -Path '" + directory + "' -Recurse | Unblock-File\"",
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+
+                using (var process = Process.Start(psi))
+                {
+                    process.WaitForExit(30000);
+                }
+            }
+            catch { }
+        }
+
+        private async Task CreatePvsInfo(Dictionary<string, string> versions)
+        {
+            try
+            {
+                UpdateCurrentTask("Creating pvs.info...");
+                LogActivity("Creating pvs.info file...");
+                
+                string pvsInfo = Path.Combine(installDir, "pvs.info");
+                var lines = new List<string>();
+                
+                lines.Add("INSTALL_PATH=" + installDir);
+                
+                // Ordered output: PowerShell related -> VSCode -> Python
+                string[] order = { 
+                    "PWSH7_VERSION", 
+                    "OHMYPOSH_VERSION", 
+                    "TERMINAL_ICONS_VERSION", 
+                    "PSFZF_VERSION", 
+                    "MODERN_UNIX_WIN_VERSION",
+                    "VSCODE_VERSION",
+                    "PYTHON_VERSION"
+                };
+                
+                foreach (var key in order)
+                {
+                    if (versions.ContainsKey(key))
+                        lines.Add(key + "=" + versions[key]);
+                }
+
+                File.WriteAllLines(pvsInfo, lines, Encoding.UTF8);
+                LogActivity("pvs.info created successfully at: " + pvsInfo);
+                await Task.CompletedTask;
+            }
+            catch (Exception ex)
+            {
+                LogActivity("ERROR: Failed to create pvs.info - " + ex.Message);
+            }
+        }
+
+        private async Task CreateShortcuts()
+        {
+            try
+            {
+                UpdateCurrentTask("Creating shortcuts...");
+                
+                string launcherPath = Path.Combine(installDir, "launcher.exe");
+                string iconPath = Path.Combine(installDir, "Code.exe");
+
+                ShortcutManager.CreateShortcuts(installDir, launcherPath, iconPath);
+                
+                await Task.CompletedTask;
+            }
+            catch { }
+        }
+
+        private async Task CopyLauncher()
+        {
+            try
+            {
+                UpdateCurrentTask("Extracting launcher...");
+                LogActivity("Extracting launcher.exe from embedded resources...");
+                
+                var assembly = Assembly.GetExecutingAssembly();
+                string launcherDest = Path.Combine(installDir, "launcher.exe");
+                
+                // Try multiple resource name patterns
+                string[] resourceNames = new[] {
+                    "launcher.exe",
+                    "VSCodePortableInstaller.launcher.exe",
+                    "res.launcher.exe"
+                };
+                
+                System.IO.Stream stream = null;
+                foreach (var name in resourceNames)
+                {
+                    stream = assembly.GetManifestResourceStream(name);
+                    if (stream != null)
+                    {
+                        LogActivity("Found launcher resource: " + name);
+                        break;
+                    }
+                }
+                
+                if (stream == null)
+                {
+                    // List all embedded resources for debugging
+                    var allResources = assembly.GetManifestResourceNames();
+                    LogActivity("Available embedded resources:");
+                    foreach (var res in allResources)
+                    {
+                        LogActivity("  - " + res);
+                    }
+                    throw new Exception("launcher.exe not found in embedded resources");
+                }
+                
+                using (stream)
+                using (var fileStream = File.Create(launcherDest))
+                {
+                    stream.CopyTo(fileStream);
+                    LogActivity("Launcher extracted to: " + launcherDest);
+                }
+
+                await Task.CompletedTask;
+            }
+            catch (Exception ex)
+            {
+                LogActivity("Error copying launcher: " + ex.Message);
+                throw;
+            }
+        }
+
+        private string ReadEmbeddedResource(string resourceName)
+        {
+            var assembly = Assembly.GetExecutingAssembly();
+            using (var stream = assembly.GetManifestResourceStream(resourceName))
+            {
+                if (stream == null)
+                    return null;
+                using (var reader = new StreamReader(stream))
+                {
+                    return reader.ReadToEnd();
+                }
+            }
+        }
+    }
+}

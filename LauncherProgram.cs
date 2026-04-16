@@ -1,0 +1,774 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using VSCodePortableCommon;
+
+namespace VSCodePortableLauncher
+{
+    class Program
+    {
+        [STAThread]
+        static int Main(string[] args)
+        {
+            try
+            {
+                // --init argument for PVS reset/initialization
+                if (args.Contains("--init"))
+                {
+                    return InitializePVS();
+                }
+
+                // Internal argument for background version check
+                if (args.Contains("--check-versions-internal"))
+                {
+                    return CheckVersionsAsync().Result;
+                }
+
+                // Check if launched from shortcut
+                bool fromShortcut = args.Contains("--from-shortcut");
+
+                // Default: Run launcher
+                return RunLauncher(fromShortcut);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Error: " + ex.Message + "\n\n" + ex.StackTrace,
+                    "VSCode Portable Launcher Error",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+                return 1;
+            }
+        }
+
+        static int RunLauncher(bool fromShortcut = false)
+        {
+            string pvsDir = AppDomain.CurrentDomain.BaseDirectory;
+            string pvsInfo = Path.Combine(pvsDir, "pvs.info");
+
+            // Step 1: Check if launched from shortcut
+            bool pathChanged = false;
+            if (!fromShortcut)
+            {
+                // Step 2: Check if path matches pvs.info
+                pathChanged = CheckPathMigration(pvsDir, pvsInfo);
+
+                if (pathChanged)
+                {
+                    // Step 3: Path or PC changed - Update shortcuts and fonts (background)
+                    ManageShortcuts(pvsDir, true);
+                    EnsureFonts(pvsDir);
+                }
+            }
+
+            // Step 4: Check for pending upgrades
+            var upgradeFlags = new[] {
+                "upgrade_pwsh7", "upgrade_ohmyposh", "upgrade_term_icons",
+                "upgrade_psfzf", "upgrade_modern_unix", "upgrade_vscode"
+            };
+
+            var pendingUpgrades = upgradeFlags.Where(flag => File.Exists(Path.Combine(pvsDir, flag))).ToList();
+
+            if (pendingUpgrades.Any())
+            {
+                // Step 5: Show upgrade form
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
+
+                var form = new UpgradeForm(pvsDir, pendingUpgrades);
+                Application.Run(form);
+
+                // After form closes, launch VSCode and check versions in background
+                // (both Cancel and Upgrade paths)
+                LaunchVSCodeAndCheckVersions(pvsDir);
+                return 0;
+            }
+
+            // Step 6: No upgrades - Launch VSCode and check versions in background
+            LaunchVSCodeAndCheckVersions(pvsDir);
+
+            return 0;
+        }
+
+        static void LaunchVSCodeAndCheckVersions(string pvsDir)
+        {
+            // Launch VSCode
+            LaunchVSCode(pvsDir);
+
+            // Start background version check
+            string launcherExe = Path.Combine(pvsDir, "launcher.exe");
+            if (File.Exists(launcherExe))
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = launcherExe,
+                    Arguments = "--check-versions-internal",
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    WindowStyle = ProcessWindowStyle.Hidden
+                };
+                Process.Start(psi);
+            }
+        }
+
+        static void LaunchVSCode(string pvsDir)
+        {
+            string codeExe = Path.Combine(pvsDir, "Code.exe");
+            if (!File.Exists(codeExe))
+            {
+                MessageBox.Show("Code.exe not found. Please run installer.exe to install.",
+                    "Error",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+                return;
+            }
+
+            // Portable mode: explicitly specify extensions directory
+            string extensionsDir = Path.Combine(pvsDir, "data", "extensions");
+            string userDataDir = Path.Combine(pvsDir, "data", "user-data");
+            
+            var psi = new ProcessStartInfo
+            {
+                FileName = codeExe,
+                Arguments = "--extensions-dir \"" + extensionsDir + "\" --user-data-dir \"" + userDataDir + "\"",
+                UseShellExecute = false
+            };
+            
+            Process.Start(psi);
+        }
+
+        static bool CheckPathMigration(string pvsDir, string pvsInfo)
+        {
+            if (!File.Exists(pvsInfo))
+                return false;
+
+            string storedPath = null;
+            foreach (var line in File.ReadAllLines(pvsInfo))
+            {
+                if (line.StartsWith("INSTALL_PATH="))
+                {
+                    storedPath = line.Substring("INSTALL_PATH=".Length);
+                    break;
+                }
+            }
+
+            if (string.IsNullOrEmpty(storedPath))
+                return false;
+
+            string currentPath = pvsDir.TrimEnd('\\');
+            storedPath = storedPath.TrimEnd('\\');
+
+            if (string.Equals(currentPath, storedPath, StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            // Update INSTALL_PATH in pvs.info
+            var lines = File.ReadAllLines(pvsInfo);
+            for (int i = 0; i < lines.Length; i++)
+            {
+                if (lines[i].StartsWith("INSTALL_PATH="))
+                {
+                    lines[i] = "INSTALL_PATH=" + currentPath;
+                    break;
+                }
+            }
+            File.WriteAllLines(pvsInfo, lines);
+
+            return true;
+        }
+
+        static void ManageShortcuts(string pvsDir, bool forceUpdate)
+        {
+            string launcherPath = Path.Combine(pvsDir, "launcher.exe");
+            string iconPath = Path.Combine(pvsDir, "Code.exe");
+
+            string desktop = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
+            string startMenu = Environment.GetFolderPath(Environment.SpecialFolder.Programs);
+            string shortcutName = "VSCode (Portable)";
+
+            ShortcutManager.CreateOrUpdateShortcut(desktop, shortcutName, launcherPath, iconPath, pvsDir, "--from-shortcut", forceUpdate);
+            ShortcutManager.CreateOrUpdateShortcut(startMenu, shortcutName, launcherPath, iconPath, pvsDir, "--from-shortcut", forceUpdate);
+        }
+
+        static void EnsureFonts(string pvsDir)
+        {
+            string fontDir = Path.Combine(pvsDir, "data", "lib", "fonts");
+
+            FontManager.EnsureFontInstalled(fontDir, "0xProtoNerdFont-Regular.ttf", "0xProto Nerd Font Mono");
+            FontManager.EnsureFontInstalled(fontDir, "DalseoHealingMedium.ttf", "DalseoHealing");
+        }
+
+        static async Task<int> CheckVersionsAsync()
+        {
+            string pvsDir = AppDomain.CurrentDomain.BaseDirectory;
+            string pvsInfo = Path.Combine(pvsDir, "pvs.info");
+
+            try
+            {
+                CommonHelper.EnableTls12();
+
+                if (!File.Exists(pvsInfo))
+                    return 0;
+
+                var versions = ReadVersionsFromInfo(pvsInfo);
+
+                await Task.WhenAll(
+                    CheckPowerShell7Version(pvsDir, versions),
+                    CheckOhMyPoshVersion(pvsDir, versions),
+                    CheckTerminalIconsVersion(pvsDir, versions),
+                    CheckPSFzfVersion(pvsDir, versions),
+                    CheckModernUnixVersion(pvsDir, versions),
+                    CheckVSCodeVersion(pvsDir, versions)
+                );
+
+                return 0;
+            }
+            catch
+            {
+                return 1;
+            }
+        }
+
+        static Dictionary<string, string> ReadVersionsFromInfo(string pvsInfo)
+        {
+            var versions = new Dictionary<string, string>();
+            foreach (var line in File.ReadAllLines(pvsInfo))
+            {
+                int idx = line.IndexOf('=');
+                if (idx > 0)
+                {
+                    versions[line.Substring(0, idx)] = line.Substring(idx + 1);
+                }
+            }
+            return versions;
+        }
+
+        static async Task CheckPowerShell7Version(string pvsDir, Dictionary<string, string> versions)
+        {
+            try
+            {
+                if (!versions.ContainsKey("PWSH7_VERSION"))
+                    return;
+
+                string currentVer = versions["PWSH7_VERSION"];
+                string latestVer = await GetLatestGitHubRelease("PowerShell/PowerShell");
+
+                if (!string.IsNullOrEmpty(latestVer) && latestVer != currentVer)
+                {
+                    File.WriteAllText(Path.Combine(pvsDir, "upgrade_pwsh7"), latestVer);
+                    versions["PWSH7_VERSION"] = latestVer;
+                }
+            }
+            catch { }
+        }
+
+        static async Task CheckOhMyPoshVersion(string pvsDir, Dictionary<string, string> versions)
+        {
+            try
+            {
+                if (!versions.ContainsKey("OHMYPOSH_VERSION"))
+                    return;
+
+                string currentVer = versions["OHMYPOSH_VERSION"];
+                string latestVer = await GetLatestGitHubRelease("JanDeDobbeleer/oh-my-posh");
+
+                if (!string.IsNullOrEmpty(latestVer) && latestVer != currentVer)
+                {
+                    File.WriteAllText(Path.Combine(pvsDir, "upgrade_ohmyposh"), latestVer);
+                    versions["OHMYPOSH_VERSION"] = latestVer;
+                }
+            }
+            catch { }
+        }
+
+        static async Task CheckTerminalIconsVersion(string pvsDir, Dictionary<string, string> versions)
+        {
+            try
+            {
+                if (!versions.ContainsKey("TERMINAL_ICONS_VERSION"))
+                    return;
+
+                string currentVer = versions["TERMINAL_ICONS_VERSION"];
+                string latestVer = await GetLatestPSGalleryVersion("Terminal-Icons");
+
+                if (!string.IsNullOrEmpty(latestVer) && latestVer != currentVer)
+                {
+                    File.WriteAllText(Path.Combine(pvsDir, "upgrade_term_icons"), latestVer);
+                    versions["TERMINAL_ICONS_VERSION"] = latestVer;
+                }
+            }
+            catch { }
+        }
+
+        static async Task CheckPSFzfVersion(string pvsDir, Dictionary<string, string> versions)
+        {
+            try
+            {
+                if (!versions.ContainsKey("PSFZF_VERSION"))
+                    return;
+
+                string currentVer = versions["PSFZF_VERSION"];
+                string latestVer = await GetLatestPSGalleryVersion("PSFzf");
+
+                if (!string.IsNullOrEmpty(latestVer) && latestVer != currentVer)
+                {
+                    File.WriteAllText(Path.Combine(pvsDir, "upgrade_psfzf"), latestVer);
+                    versions["PSFZF_VERSION"] = latestVer;
+                }
+            }
+            catch { }
+        }
+
+        static async Task CheckModernUnixVersion(string pvsDir, Dictionary<string, string> versions)
+        {
+            try
+            {
+                if (!versions.ContainsKey("MODERN_UNIX_WIN_VERSION"))
+                    return;
+
+                string currentVer = versions["MODERN_UNIX_WIN_VERSION"];
+                string latestVer = await GetLatestPSGalleryVersion("modern-unix-win");
+
+                if (!string.IsNullOrEmpty(latestVer) && latestVer != currentVer)
+                {
+                    File.WriteAllText(Path.Combine(pvsDir, "upgrade_modern_unix"), latestVer);
+                    versions["MODERN_UNIX_WIN_VERSION"] = latestVer;
+                }
+            }
+            catch { }
+        }
+
+        static async Task CheckVSCodeVersion(string pvsDir, Dictionary<string, string> versions)
+        {
+            try
+            {
+                if (!versions.ContainsKey("VSCODE_VERSION"))
+                    return;
+
+                string currentVer = versions["VSCODE_VERSION"];
+                string latestVer = await GetLatestVSCodeVersion();
+
+                if (!string.IsNullOrEmpty(latestVer) && latestVer != currentVer)
+                {
+                    File.WriteAllText(Path.Combine(pvsDir, "upgrade_vscode"), latestVer);
+                    versions["VSCODE_VERSION"] = latestVer;
+                }
+            }
+            catch { }
+        }
+
+        static async Task<string> GetLatestGitHubRelease(string repo)
+        {
+            try
+            {
+                string url = string.Format("https://api.github.com/repos/{0}/releases/latest", repo);
+                using (var client = new System.Net.Http.HttpClient())
+                {
+                    client.DefaultRequestHeaders.Add("User-Agent", "VSCode-Portable-Launcher");
+                    client.DefaultRequestHeaders.ConnectionClose = false; // Keep-Alive
+                    client.Timeout = TimeSpan.FromSeconds(30);
+                    string json = await client.GetStringAsync(url);
+                    var match = Regex.Match(json, "\"tag_name\"\\s*:\\s*\"v?([^\"]+)\"");
+                    return match.Success ? match.Groups[1].Value : "";
+                }
+            }
+            catch
+            {
+                return "";
+            }
+        }
+
+        static async Task<string> GetLatestPSGalleryVersion(string moduleName)
+        {
+            try
+            {
+                string url = string.Format("https://www.powershellgallery.com/packages/{0}", moduleName);
+                using (var client = new System.Net.Http.HttpClient())
+                {
+                    client.DefaultRequestHeaders.Add("User-Agent", "VSCode-Portable-Launcher");
+                    client.DefaultRequestHeaders.ConnectionClose = false; // Keep-Alive
+                    client.Timeout = TimeSpan.FromSeconds(30);
+                    string html = await client.GetStringAsync(url);
+                    var match = Regex.Match(html, string.Format("{0}\\s+([\\d\\.]+)", moduleName));
+                    return match.Success ? match.Groups[1].Value : "";
+                }
+            }
+            catch
+            {
+                return "";
+            }
+        }
+
+        static int InitializePVS()
+        {
+            string pvsDir = AppDomain.CurrentDomain.BaseDirectory;
+            
+            try
+            {
+                Console.WriteLine("Initializing PVS environment...");
+                
+                // 1. Sync VSCode extensions
+                Console.WriteLine("1/6: Synchronizing VSCode extensions...");
+                SyncVSCodeExtensions(pvsDir);
+                
+                // 2. Restore origin files
+                Console.WriteLine("2/6: Restoring configuration files...");
+                RestoreOriginFiles(pvsDir);
+                
+                // 3. Clean Python environment
+                Console.WriteLine("3/6: Cleaning Python environment...");
+                CleanPythonEnvironment(pvsDir);
+                
+                // 4. Install fonts and create shortcuts
+                Console.WriteLine("4/6: Installing fonts and creating shortcuts...");
+                InstallFontsAndShortcuts(pvsDir);
+                
+                // 5. Clean user-data (except settings.json)
+                Console.WriteLine("5/6: Cleaning user data...");
+                CleanUserData(pvsDir);
+                
+                // 6. Launch VSCode
+                Console.WriteLine("6/6: Launching VSCode...");
+                LaunchVSCodeAndExit(pvsDir);
+                
+                Console.WriteLine("PVS initialization completed successfully!");
+                return 0;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Initialization error: " + ex.Message);
+                Console.WriteLine(ex.StackTrace);
+                return 1;
+            }
+        }
+
+        static void SyncVSCodeExtensions(string pvsDir)
+        {
+            try
+            {
+                string extensionsDir = Path.Combine(pvsDir, "data", "extensions");
+                if (!Directory.Exists(extensionsDir))
+                {
+                    Console.WriteLine("  Extensions directory not found, skipping...");
+                    return;
+                }
+
+                // Get installed extensions
+                var installedDirs = Directory.GetDirectories(extensionsDir)
+                    .Select(d => Path.GetFileName(d))
+                    .Where(name => !string.IsNullOrEmpty(name))
+                    .ToList();
+
+                var requiredExtensions = UpgradeForm.VSCODE_EXTENSIONS.ToList();
+                
+                // Find extensions to remove (not in required list)
+                var toRemove = installedDirs.Where(installed =>
+                {
+                    return !requiredExtensions.Any(required =>
+                        installed.StartsWith(required + "-", StringComparison.OrdinalIgnoreCase));
+                }).ToList();
+
+                // Remove unwanted extensions
+                foreach (var ext in toRemove)
+                {
+                    string extPath = Path.Combine(extensionsDir, ext);
+                    Console.WriteLine("  Removing: " + ext);
+                    Directory.Delete(extPath, true);
+                }
+
+                // Find extensions to install (required but not installed)
+                var toInstall = requiredExtensions.Where(required =>
+                {
+                    return !installedDirs.Any(installed =>
+                        installed.StartsWith(required + "-", StringComparison.OrdinalIgnoreCase));
+                }).ToList();
+
+                // Install missing extensions
+                if (toInstall.Any())
+                {
+                    string codeExe = Path.Combine(pvsDir, "Code.exe");
+                    string cliJs = Path.Combine(pvsDir, "resources", "app", "out", "cli.js");
+                    string relativeExtensionsDir = Path.Combine("data", "extensions");
+                    string relativeUserDataDir = Path.Combine("data", "user-data");
+
+                    foreach (var ext in toInstall)
+                    {
+                        Console.WriteLine("  Installing: " + ext);
+                        var psi = new ProcessStartInfo
+                        {
+                            FileName = codeExe,
+                            Arguments = "\"" + cliJs + "\" --extensions-dir \"" + relativeExtensionsDir + "\" --user-data-dir \"" + relativeUserDataDir + "\" --install-extension " + ext + " --force",
+                            UseShellExecute = false,
+                            CreateNoWindow = true,
+                            WorkingDirectory = pvsDir
+                        };
+                        psi.EnvironmentVariables["ELECTRON_RUN_AS_NODE"] = "1";
+                        
+                        using (var process = Process.Start(psi))
+                        {
+                            process.WaitForExit();
+                        }
+                    }
+                }
+
+                // Delete extensions.json
+                string extensionsJson = Path.Combine(extensionsDir, "extensions.json");
+                if (File.Exists(extensionsJson))
+                {
+                    Console.WriteLine("  Deleting extensions.json");
+                    File.Delete(extensionsJson);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("  Extension sync error: " + ex.Message);
+            }
+        }
+
+        static void RestoreOriginFiles(string pvsDir)
+        {
+            try
+            {
+                string originDir = Path.Combine(pvsDir, "data", "lib", "origin");
+                if (!Directory.Exists(originDir))
+                {
+                    Console.WriteLine("  Origin directory not found, skipping...");
+                    return;
+                }
+
+                // Restore settings.json
+                string originSettings = Path.Combine(originDir, "settings.json");
+                if (File.Exists(originSettings))
+                {
+                    string targetSettings = Path.Combine(pvsDir, "data", "user-data", "User", "settings.json");
+                    Directory.CreateDirectory(Path.GetDirectoryName(targetSettings));
+                    File.Copy(originSettings, targetSettings, true);
+                    Console.WriteLine("  Restored: settings.json");
+                }
+
+                // Restore Microsoft.PowerShell_profile.ps1
+                string originProfile = Path.Combine(originDir, "Microsoft.PowerShell_profile.ps1");
+                if (File.Exists(originProfile))
+                {
+                    string targetProfile = Path.Combine(pvsDir, "data", "lib", "pwsh", "Microsoft.PowerShell_profile.ps1");
+                    File.Copy(originProfile, targetProfile, true);
+                    Console.WriteLine("  Restored: Microsoft.PowerShell_profile.ps1");
+                }
+
+                // Restore tos-term.omp.json
+                string originTheme = Path.Combine(originDir, "tos-term.omp.json");
+                if (File.Exists(originTheme))
+                {
+                    string targetTheme = Path.Combine(pvsDir, "data", "lib", "pwsh", "ohmyposh", "themes", "tos-term.omp.json");
+                    Directory.CreateDirectory(Path.GetDirectoryName(targetTheme));
+                    File.Copy(originTheme, targetTheme, true);
+                    Console.WriteLine("  Restored: tos-term.omp.json");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("  Origin file restore error: " + ex.Message);
+            }
+        }
+
+        static void CleanPythonEnvironment(string pvsDir)
+        {
+            try
+            {
+                // Delete Scripts folder
+                string scriptsDir = Path.Combine(pvsDir, "data", "lib", "python", "Scripts");
+                if (Directory.Exists(scriptsDir))
+                {
+                    Directory.Delete(scriptsDir, true);
+                    Console.WriteLine("  Deleted: Scripts folder");
+                }
+
+                // Clean site-packages (keep only pip*)
+                string sitePackages = Path.Combine(pvsDir, "data", "lib", "python", "Lib", "site-packages");
+                if (Directory.Exists(sitePackages))
+                {
+                    var items = Directory.GetFileSystemEntries(sitePackages);
+                    foreach (var item in items)
+                    {
+                        string name = Path.GetFileName(item);
+                        if (!name.StartsWith("pip", StringComparison.OrdinalIgnoreCase))
+                        {
+                            if (Directory.Exists(item))
+                                Directory.Delete(item, true);
+                            else
+                                File.Delete(item);
+                        }
+                    }
+                    Console.WriteLine("  Cleaned: site-packages (kept pip* only)");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("  Python cleanup error: " + ex.Message);
+            }
+        }
+
+        static void InstallFontsAndShortcuts(string pvsDir)
+        {
+            try
+            {
+                // Install fonts
+                string fontsDir = Path.Combine(pvsDir, "data", "lib", "fonts");
+                if (Directory.Exists(fontsDir))
+                {
+                    string nerdFont = Path.Combine(fontsDir, "0xProtoNerdFont-Regular.ttf");
+                    string dalseoFont = Path.Combine(fontsDir, "DalseoHealingMedium.ttf");
+
+                    if (File.Exists(nerdFont))
+                    {
+                        var psi = new ProcessStartInfo
+                        {
+                            FileName = "reg",
+                            Arguments = "add \"HKCU\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts\" /v \"0xProto Nerd Font Mono\" /d \"" + nerdFont + "\" /f",
+                            UseShellExecute = false,
+                            CreateNoWindow = true
+                        };
+                        using (var process = Process.Start(psi))
+                            process.WaitForExit();
+                        Console.WriteLine("  Installed: 0xProto Nerd Font");
+                    }
+
+                    if (File.Exists(dalseoFont))
+                    {
+                        var psi = new ProcessStartInfo
+                        {
+                            FileName = "reg",
+                            Arguments = "add \"HKCU\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts\" /v \"DalseoHealing\" /d \"" + dalseoFont + "\" /f",
+                            UseShellExecute = false,
+                            CreateNoWindow = true
+                        };
+                        using (var process = Process.Start(psi))
+                            process.WaitForExit();
+                        Console.WriteLine("  Installed: DalseoHealing Font");
+                    }
+                }
+
+                // Create shortcuts
+                string launcherPath = Path.Combine(pvsDir, "launcher.exe");
+                string iconPath = Path.Combine(pvsDir, "Code.exe");
+                
+                if (File.Exists(launcherPath) && File.Exists(iconPath))
+                {
+                    ShortcutManager.CreateShortcuts(pvsDir, launcherPath, iconPath);
+                    Console.WriteLine("  Created: Desktop and Start Menu shortcuts");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("  Font/shortcut error: " + ex.Message);
+            }
+        }
+
+        static void CleanUserData(string pvsDir)
+        {
+            try
+            {
+                string userDataDir = Path.Combine(pvsDir, "data", "user-data");
+                if (!Directory.Exists(userDataDir))
+                    return;
+
+                // Get settings.json path to preserve
+                string settingsPath = Path.Combine(userDataDir, "User", "settings.json");
+                
+                // Delete all items except User/settings.json
+                var items = Directory.GetFileSystemEntries(userDataDir);
+                foreach (var item in items)
+                {
+                    string name = Path.GetFileName(item);
+                    
+                    if (name.Equals("User", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // Keep User folder but clean its contents except settings.json
+                        var userItems = Directory.GetFileSystemEntries(item);
+                        foreach (var userItem in userItems)
+                        {
+                            if (!userItem.Equals(settingsPath, StringComparison.OrdinalIgnoreCase))
+                            {
+                                if (Directory.Exists(userItem))
+                                    Directory.Delete(userItem, true);
+                                else
+                                    File.Delete(userItem);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // Delete everything else
+                        if (Directory.Exists(item))
+                            Directory.Delete(item, true);
+                        else
+                            File.Delete(item);
+                    }
+                }
+                
+                Console.WriteLine("  Cleaned: user-data (kept settings.json)");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("  User data cleanup error: " + ex.Message);
+            }
+        }
+
+        static void LaunchVSCodeAndExit(string pvsDir)
+        {
+            try
+            {
+                string codeExe = Path.Combine(pvsDir, "Code.exe");
+                if (File.Exists(codeExe))
+                {
+                    var psi = new ProcessStartInfo
+                    {
+                        FileName = codeExe,
+                        WorkingDirectory = pvsDir,
+                        UseShellExecute = false
+                    };
+                    
+                    using (var process = Process.Start(psi))
+                    {
+                        // Wait a bit for VSCode to initialize
+                        System.Threading.Thread.Sleep(2000);
+                    }
+                    
+                    Console.WriteLine("  VSCode launched");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("  VSCode launch error: " + ex.Message);
+            }
+        }
+
+        static async Task<string> GetLatestVSCodeVersion()
+        {
+            try
+            {
+                var request = (HttpWebRequest)WebRequest.Create("https://update.code.visualstudio.com/latest/win32-x64-archive/stable");
+                request.Method = "HEAD";
+                request.AllowAutoRedirect = false;
+
+                using (var response = (HttpWebResponse)await request.GetResponseAsync())
+                {
+                    string redirectUrl = response.Headers["Location"];
+                    if (!string.IsNullOrEmpty(redirectUrl))
+                    {
+                        var match = Regex.Match(redirectUrl, "VSCode-win32-x64-([\\d\\.]+)\\.zip");
+                        return match.Success ? match.Groups[1].Value : "";
+                    }
+                }
+            }
+            catch
+            {
+            }
+            return "";
+        }
+    }
+}
