@@ -771,13 +771,168 @@ namespace VSCodePortableCommon
         public async Task<KeyValuePair<string, string>> InstallModuleAsync(string moduleName, string versionKey, int maxWaitSeconds = 30)
         {
             string version = "";
+            string modulesPath = Path.Combine(baseDir, "data", "lib", "pwsh", "Modules");
+            string tempZip = Path.Combine(Path.GetTempPath(), moduleName + "_" + Guid.NewGuid().ToString().Substring(0, 8) + ".zip");
+            string extractPath = Path.Combine(Path.GetTempPath(), moduleName + "_extract_" + Guid.NewGuid().ToString().Substring(0, 8));
 
             try
             {
-                updateStatus(moduleName, "Waiting for PowerShell...", 10);
-                logActivity(moduleName + ": Waiting for PowerShell to be ready...");
+                updateStatus(moduleName, "Downloading...", 10);
+                logActivity(moduleName + ": Downloading from PSGallery API...");
 
-                string pwshExe = Path.Combine(baseDir, "data", "lib", "pwsh", "pwsh.exe");
+                Directory.CreateDirectory(modulesPath);
+                string downloadUrl = "https://www.powershellgallery.com/api/v2/package/" + moduleName;
+                bool downloadSucceeded = false;
+
+                try
+                {
+                    using (var client = new HttpClient())
+                    {
+                        client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)");
+                        var response = await client.GetAsync(downloadUrl, HttpCompletionOption.ResponseHeadersRead);
+                        response.EnsureSuccessStatusCode();
+
+                        using (var fs = new FileStream(tempZip, FileMode.Create, FileAccess.Write, FileShare.None))
+                        {
+                            await response.Content.CopyToAsync(fs);
+                        }
+                    }
+
+                    downloadSucceeded = true;
+                }
+                catch (Exception dlEx)
+                {
+                    logActivity(moduleName + ": Fast download failed, falling back to Save-Module: " + dlEx.Message);
+                }
+
+                if (!downloadSucceeded)
+                    return await InstallModuleLegacyAsync(moduleName, versionKey, maxWaitSeconds);
+
+                updateStatus(moduleName, "Extracting...", 50);
+                logActivity(moduleName + ": Extracting package...");
+                Directory.CreateDirectory(extractPath);
+                bool extractSucceeded = false;
+                
+                try
+                {
+                    await CommonHelper.ExtractZipWithProgressAsync(
+                        tempZip,
+                        extractPath,
+                        moduleName,
+                        50,
+                        80,
+                        progress => updateStatus(moduleName, "Extracting...", progress),
+                        logActivity,
+                        System.Threading.CancellationToken.None
+                    );
+
+                    extractSucceeded = true;
+                }
+                catch (Exception ex)
+                {
+                    logActivity(moduleName + ": Fast extract failed, falling back to Save-Module: " + ex.Message);
+                }
+
+                if (!extractSucceeded)
+                {
+                    try { if (Directory.Exists(extractPath)) Directory.Delete(extractPath, true); } catch { }
+                    try { if (File.Exists(tempZip)) File.Delete(tempZip); } catch { }
+                    return await InstallModuleLegacyAsync(moduleName, versionKey, maxWaitSeconds);
+                }
+
+                // Parse nuspec or psd1 for version
+                updateStatus(moduleName, "Configuring...", 80);
+                string[] nuspecs = Directory.GetFiles(extractPath, "*.nuspec", SearchOption.AllDirectories);
+                if (nuspecs.Length > 0)
+                {
+                    string nuspecText = File.ReadAllText(nuspecs[0]);
+                    var match = System.Text.RegularExpressions.Regex.Match(nuspecText, @"<version>(.+?)</version>", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                    if (match.Success)
+                    {
+                        version = match.Groups[1].Value.Trim();
+                    }
+                }
+
+                if (string.IsNullOrEmpty(version))
+                {
+                    string[] psd1s = Directory.GetFiles(extractPath, "*.psd1", SearchOption.AllDirectories);
+                    if (psd1s.Length > 0)
+                    {
+                        string psd1Text = File.ReadAllText(psd1s[0]);
+                        var match = System.Text.RegularExpressions.Regex.Match(psd1Text, @"ModuleVersion\s*=\s*'([^']+)'", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                        if (match.Success)
+                        {
+                            version = match.Groups[1].Value.Trim();
+                        }
+                        else
+                        {
+                            version = "1.0.0"; // Fallback
+                        }
+                    }
+                    else
+                    {
+                        version = "1.0.0";
+                    }
+                }
+
+                string finalModuleDir = Path.Combine(modulesPath, moduleName, version);
+                bool installSucceeded = false;
+                try
+                {
+                    if (Directory.Exists(finalModuleDir))
+                        Directory.Delete(finalModuleDir, true);
+                    Directory.CreateDirectory(finalModuleDir);
+
+                    // Move all files to final path
+                    int prefixLength = extractPath.Length;
+                    if (!extractPath.EndsWith("\\") && !extractPath.EndsWith("/"))
+                        prefixLength++;
+                        
+                    foreach (string dirPath in Directory.GetDirectories(extractPath, "*", SearchOption.AllDirectories))
+                        Directory.CreateDirectory(Path.Combine(finalModuleDir, dirPath.Substring(prefixLength)));
+                    foreach (string newPath in Directory.GetFiles(extractPath, "*.*", SearchOption.AllDirectories))
+                        File.Copy(newPath, Path.Combine(finalModuleDir, newPath.Substring(prefixLength)), true);
+
+                    // Cleanup temp files
+                    Directory.Delete(extractPath, true);
+                    File.Delete(tempZip);
+
+                    installSucceeded = true;
+                }
+                catch (Exception ex)
+                {
+                    logActivity(moduleName + ": Moving module files failed, falling back to Save-Module: " + ex.Message);
+                }
+
+                if (!installSucceeded)
+                {
+                    try { if (Directory.Exists(extractPath)) Directory.Delete(extractPath, true); } catch { }
+                    try { if (File.Exists(tempZip)) File.Delete(tempZip); } catch { }
+                    return await InstallModuleLegacyAsync(moduleName, versionKey, maxWaitSeconds);
+                }
+
+                logActivity(moduleName + ": Successfully installed version " + version);
+                return new KeyValuePair<string, string>(versionKey, version);
+            }
+            catch (Exception ex)
+            {
+                logActivity(moduleName + ": Installation failed - " + ex.Message);
+                try { if (Directory.Exists(extractPath)) Directory.Delete(extractPath, true); } catch { }
+                try { if (File.Exists(tempZip)) File.Delete(tempZip); } catch { }
+                return new KeyValuePair<string, string>(versionKey, "");
+            }
+        }
+
+        public async Task<KeyValuePair<string, string>> InstallModuleLegacyAsync(string moduleName, string versionKey, int maxWaitSeconds = 30)
+        {
+                string version = "";
+
+                try
+                {
+                    updateStatus(moduleName, "Waiting for PowerShell...", 10);
+                    logActivity(moduleName + ": Waiting for PowerShell to be ready...");
+
+                    string pwshExe = Path.Combine(baseDir, "data", "lib", "pwsh", "pwsh.exe");
                 int retries = 0;
                 while (!File.Exists(pwshExe) && retries < maxWaitSeconds * 2)
                 {
