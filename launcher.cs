@@ -31,7 +31,7 @@ namespace VSCodePortableLauncher
             "teabyii.ayu",
             "zhuangtongfa.material-theme",
             "ms-python.python",
-            "ms-toolsai.jupyter",
+            "ms-python.vscode-pylance",
             "ms-vscode-remote.remote-ssh",
             "KevinRose.vsc-python-indent",
             "usernamehw.errorlens",

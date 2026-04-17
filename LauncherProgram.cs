@@ -52,13 +52,13 @@ namespace VSCodePortableLauncher
             string pvsInfo = Path.Combine(pvsDir, "pvs.info");
 
             // Step 1: Check if launched from shortcut
-            bool pathChanged = false;
+            bool runtimeContextChanged = false;
             if (!fromShortcut)
             {
-                // Step 2: Check if path matches pvs.info
-                pathChanged = CheckPathMigration(pvsDir, pvsInfo);
+                // Step 2: Check if path, machine, or user context changed
+                runtimeContextChanged = CheckRuntimeMigration(pvsDir, pvsInfo);
 
-                if (pathChanged)
+                if (runtimeContextChanged)
                 {
                     // Step 3: Path or PC changed - Update shortcuts and fonts (background)
                     ManageShortcuts(pvsDir, true);
@@ -128,57 +128,127 @@ namespace VSCodePortableLauncher
                 return;
             }
 
-            // Portable mode: explicitly specify extensions directory
+            Process.Start(CreateVSCodeStartInfo(pvsDir));
+        }
+
+        static ProcessStartInfo CreateVSCodeStartInfo(string pvsDir)
+        {
+            string codeExe = Path.Combine(pvsDir, "Code.exe");
             string extensionsDir = Path.Combine(pvsDir, "data", "extensions");
             string userDataDir = Path.Combine(pvsDir, "data", "user-data");
-            
+
             var psi = new ProcessStartInfo
             {
                 FileName = codeExe,
                 Arguments = "--extensions-dir \"" + extensionsDir + "\" --user-data-dir \"" + userDataDir + "\"",
+                WorkingDirectory = pvsDir,
                 UseShellExecute = false
             };
-            
-            Process.Start(psi);
+
+            ApplyPortableRuntimeEnvironment(psi, pvsDir);
+            return psi;
         }
 
-        static bool CheckPathMigration(string pvsDir, string pvsInfo)
+        static void ApplyPortableRuntimeEnvironment(ProcessStartInfo psi, string pvsDir)
+        {
+            var preferredPaths = new[]
+            {
+                Path.Combine(pvsDir, "bin"),
+                Path.Combine(pvsDir, "data", "lib", "python"),
+                Path.Combine(pvsDir, "data", "lib", "python", "Scripts"),
+                Path.Combine(pvsDir, "data", "lib", "pwsh"),
+                Path.Combine(pvsDir, "data", "lib", "pwsh", "bin")
+            };
+
+            string basePath = psi.EnvironmentVariables["PATH"];
+            if (string.IsNullOrEmpty(basePath))
+                basePath = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
+
+            var pathEntries = basePath
+                .Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries)
+                .ToList();
+
+            for (int i = preferredPaths.Length - 1; i >= 0; i--)
+            {
+                string candidate = preferredPaths[i];
+                if (!Directory.Exists(candidate))
+                    continue;
+
+                bool alreadyPresent = pathEntries.Any(existing =>
+                    string.Equals(existing.TrimEnd('\\'), candidate.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase));
+                if (!alreadyPresent)
+                    pathEntries.Insert(0, candidate);
+            }
+
+            psi.EnvironmentVariables["PATH"] = string.Join(";", pathEntries.ToArray());
+        }
+
+        static bool CheckRuntimeMigration(string pvsDir, string pvsInfo)
         {
             if (!File.Exists(pvsInfo))
                 return false;
 
-            string storedPath = null;
-            foreach (var line in File.ReadAllLines(pvsInfo))
-            {
-                if (line.StartsWith("INSTALL_PATH="))
-                {
-                    storedPath = line.Substring("INSTALL_PATH=".Length);
-                    break;
-                }
-            }
-
-            if (string.IsNullOrEmpty(storedPath))
-                return false;
-
+            var lines = File.ReadAllLines(pvsInfo).ToList();
             string currentPath = pvsDir.TrimEnd('\\');
-            storedPath = storedPath.TrimEnd('\\');
+            string currentMachineName = Environment.MachineName;
+            string currentDesktopPath = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
+            string currentProgramsPath = Environment.GetFolderPath(Environment.SpecialFolder.Programs);
 
-            if (string.Equals(currentPath, storedPath, StringComparison.OrdinalIgnoreCase))
+            string storedPath = GetInfoValue(lines, "INSTALL_PATH");
+            string storedMachineName = GetInfoValue(lines, "INSTALL_HOST_MACHINE");
+            string storedDesktopPath = GetInfoValue(lines, "INSTALL_USER_DESKTOP");
+            string storedProgramsPath = GetInfoValue(lines, "INSTALL_START_MENU");
+
+            bool pathChanged = !PathsEqual(currentPath, storedPath);
+            bool machineChanged = !string.Equals(currentMachineName ?? string.Empty, storedMachineName ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+            bool desktopChanged = !PathsEqual(currentDesktopPath, storedDesktopPath);
+            bool programsChanged = !PathsEqual(currentProgramsPath, storedProgramsPath);
+            bool missingContext = string.IsNullOrEmpty(storedMachineName) || string.IsNullOrEmpty(storedDesktopPath) || string.IsNullOrEmpty(storedProgramsPath);
+
+            if (!pathChanged && !machineChanged && !desktopChanged && !programsChanged && !missingContext)
                 return false;
 
-            // Update INSTALL_PATH in pvs.info
-            var lines = File.ReadAllLines(pvsInfo);
-            for (int i = 0; i < lines.Length; i++)
-            {
-                if (lines[i].StartsWith("INSTALL_PATH="))
-                {
-                    lines[i] = "INSTALL_PATH=" + currentPath;
-                    break;
-                }
-            }
+            UpsertInfoValue(lines, "INSTALL_PATH", currentPath);
+            UpsertInfoValue(lines, "INSTALL_HOST_MACHINE", currentMachineName);
+            UpsertInfoValue(lines, "INSTALL_USER_DESKTOP", currentDesktopPath);
+            UpsertInfoValue(lines, "INSTALL_START_MENU", currentProgramsPath);
+
             File.WriteAllLines(pvsInfo, lines);
 
             return true;
+        }
+
+        static string GetInfoValue(IList<string> lines, string key)
+        {
+            foreach (var line in lines)
+            {
+                if (line.StartsWith(key + "="))
+                    return line.Substring(key.Length + 1);
+            }
+
+            return null;
+        }
+
+        static void UpsertInfoValue(IList<string> lines, string key, string value)
+        {
+            string normalizedValue = value ?? string.Empty;
+            for (int i = 0; i < lines.Count; i++)
+            {
+                if (lines[i].StartsWith(key + "="))
+                {
+                    lines[i] = key + "=" + normalizedValue;
+                    return;
+                }
+            }
+
+            lines.Add(key + "=" + normalizedValue);
+        }
+
+        static bool PathsEqual(string left, string right)
+        {
+            string normalizedLeft = string.IsNullOrEmpty(left) ? string.Empty : left.TrimEnd('\\');
+            string normalizedRight = string.IsNullOrEmpty(right) ? string.Empty : right.TrimEnd('\\');
+            return string.Equals(normalizedLeft, normalizedRight, StringComparison.OrdinalIgnoreCase);
         }
 
         static void ManageShortcuts(string pvsDir, bool forceUpdate)
@@ -725,12 +795,7 @@ namespace VSCodePortableLauncher
                 string codeExe = Path.Combine(pvsDir, "Code.exe");
                 if (File.Exists(codeExe))
                 {
-                    var psi = new ProcessStartInfo
-                    {
-                        FileName = codeExe,
-                        WorkingDirectory = pvsDir,
-                        UseShellExecute = false
-                    };
+                    var psi = CreateVSCodeStartInfo(pvsDir);
                     
                     using (var process = Process.Start(psi))
                     {

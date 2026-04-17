@@ -2803,7 +2803,7 @@ namespace VSCodePortableInstaller
                     "teabyii.ayu",
                     "zhuangtongfa.material-theme",
                     "ms-python.python",
-                    "ms-toolsai.jupyter",
+                    "ms-python.vscode-pylance",
                     "ms-vscode-remote.remote-ssh",
                     "KevinRose.vsc-python-indent",
                     "usernamehw.errorlens",
@@ -3550,6 +3550,9 @@ namespace VSCodePortableInstaller
                 var lines = new List<string>();
                 
                 lines.Add("INSTALL_PATH=" + installDir);
+                lines.Add("INSTALL_HOST_MACHINE=" + Environment.MachineName);
+                lines.Add("INSTALL_USER_DESKTOP=" + Environment.GetFolderPath(Environment.SpecialFolder.Desktop));
+                lines.Add("INSTALL_START_MENU=" + Environment.GetFolderPath(Environment.SpecialFolder.Programs));
                 
                 // Ordered output: PowerShell related -> VSCode -> Python
                 string[] order = { 
