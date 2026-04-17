@@ -7,6 +7,11 @@ DevEnv is a portable Windows development environment installer and updater. The 
 
 The final distributable is `devenv-setup.exe` only. `launcher.exe` is embedded into the installer and extracted into the target folder during installation.
 
+## Download
+
+- Latest release page: https://github.com/PlanXLab/DevEnv/releases/latest
+- Latest `devenv-setup.exe`: https://github.com/PlanXLab/DevEnv/releases/latest/download/devenv-setup.exe
+
 ## Current Architecture
 
 ### Installer
