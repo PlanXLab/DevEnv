@@ -20,18 +20,21 @@ namespace VSCodePortableInstaller
     partial class InstallForm : Form
     {
         // Constants
-        private const int FORM_WIDTH = 700;
-        private const int FORM_HEIGHT = 750;
         private const int MAX_DOWNLOAD_TIMEOUT_MINUTES = 10;
         private const int POWERSHELL_HEADSTART_MS = 8000;
         private const int BUFFER_SIZE = 131072;  // 128KB for faster I/O
         private const int DOWNLOAD_BUFFER_SIZE = 1048576;  // 1MB for download operations (optimized)
         private const int EXTRACT_BUFFER_SIZE = 131072;  // 128KB for faster extraction
+        private const int VSCODE_DOWNLOAD_RETRY_COUNT = 2;
+        private const int VSCODE_EXTENSION_DOWNLOAD_CONCURRENCY = 4;
+        private const int MAX_ACTIVITY_LOG_LINES = 20;
         
         // URLs
         private const string PYTHON_DOWNLOADS_URL = "https://www.python.org/downloads/windows/";
         private const string PYTHON_FTP_BASE = "https://www.python.org/ftp/python/";
         private const string BOOTSTRAP_PIP_URL = "https://bootstrap.pypa.io/get-pip.py";
+        private const string VSCODE_LATEST_DOWNLOAD_URL = "https://update.code.visualstudio.com/latest/win32-x64-archive/stable";
+        private const string VSCODE_MARKETPLACE_VSIX_URL_TEMPLATE = "https://marketplace.visualstudio.com/_apis/public/gallery/publishers/{0}/vsextensions/{1}/latest/vspackage";
         
         // Paths
         private const string TEMP_INSTALL_DIR = "vscode-pvs-install";
@@ -63,6 +66,8 @@ namespace VSCodePortableInstaller
         private System.Windows.Forms.Timer elapsedTimer;
         private StringBuilder logFileBuffer = new StringBuilder();
         private object logFileLock = new object();
+        private Queue<string> activityDisplayEntries = new Queue<string>();
+        private string overallStatusOverride = "Ready to install";
 
         // New: collapse/expand state and stored full size
         private bool isCollapsedOnStart = true;
@@ -81,6 +86,12 @@ namespace VSCodePortableInstaller
             System.Net.ServicePointManager.Expect100Continue = false;
 
             InitializeComponent();
+
+            this.AcceptButton = installButton;
+            installPathTextBox.KeyDown += InputField_KeyDown;
+            pythonVersionTextBox.KeyDown += InputField_KeyDown;
+            UpdateOverallProgress();
+            UpdateCurrentTask("Ready to install");
 
             // Capture full size (designer size) for later restore
             fullClientSize = this.ClientSize;
@@ -189,6 +200,16 @@ namespace VSCodePortableInstaller
                     installPathTextBox.Text = dialog.SelectedPath;
                 }
             }
+        }
+
+        private void InputField_KeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.KeyCode != Keys.Enter || !installButton.Enabled)
+                return;
+
+            e.SuppressKeyPress = true;
+            e.Handled = true;
+            InstallButton_Click(installButton, EventArgs.Empty);
         }
 
         private void InstallButton_Click(object sender, EventArgs e)
@@ -961,6 +982,7 @@ namespace VSCodePortableInstaller
                 {
                     UpdateCurrentTask("⚠ Installation incomplete - " + failedCount + " component(s) failed");
                     LogActivity("Installation incomplete: " + failedCount + " critical component(s) failed");
+                    SaveInstallLog();
                     
                     criticalFailed = true;
                     installCompleted = true;
@@ -1023,6 +1045,8 @@ namespace VSCodePortableInstaller
             }
             catch (Exception ex)
             {
+                LogActivity("Installation error: " + ex.Message);
+                SaveInstallLog();
                 ShowError("Installation error: " + ex.Message);
                 installCompleted = true;
             }
@@ -1108,6 +1132,8 @@ namespace VSCodePortableInstaller
             // Update progress bar
             progressBar.Value = Math.Min(progress, 100);
 
+            overallStatusOverride = null;
+
             UpdateOverallProgress();
         }
 
@@ -1146,9 +1172,7 @@ namespace VSCodePortableInstaller
             if (installTimer != null && installTimer.IsRunning && elapsedTimeLabel != null)
             {
                 var elapsed = installTimer.Elapsed;
-                string elapsedStr = string.Format("{0:D2}:{1:D2}:{2:D2}",
-                    elapsed.Hours, elapsed.Minutes, elapsed.Seconds);
-                elapsedTimeLabel.Text = "Elapsed: " + elapsedStr;
+                elapsedTimeLabel.Text = "Elapsed (mm:ss): " + FormatElapsedForUi(elapsed);
             }
         }
 
@@ -1186,44 +1210,10 @@ namespace VSCodePortableInstaller
             if (pythonProgressBar.Value >= 100) completed++;
             
             if (completed != completedComponents)
-            {
                 completedComponents = completed;
-                UpdateCompletedLabel();
-            }
-            
-            // Update current task message based on active component
-            string currentTask = "";
-            string currentStatus = "";
-            
-            if (fontsProgressBar.Value > 0 && fontsProgressBar.Value < 100)
-            {
-                currentTask = "Fonts";
-                currentStatus = fontsStatusLabel.Text.Replace("⏳ ", "").Replace("⬇ ", "").Replace("⚙ ", "").Replace("✓ ", "");
-            }
-            else if (pwshProgressBar.Value > 0 && pwshProgressBar.Value < 100)
-            {
-                currentTask = "PowerShell 7";
-                currentStatus = pwshStatusLabel.Text.Replace("⏳ ", "").Replace("⬇ ", "").Replace("⚙ ", "").Replace("✓ ", "");
-            }
-            else if (vscodeProgressBar.Value > 0 && vscodeProgressBar.Value < 100)
-            {
-                currentTask = "VSCode";
-                currentStatus = vscodeStatusLabel.Text.Replace("⏳ ", "").Replace("⬇ ", "").Replace("⚙ ", "").Replace("✓ ", "");
-            }
-            else if (pythonProgressBar.Value > 0 && pythonProgressBar.Value < 100)
-            {
-                currentTask = "Python";
-                currentStatus = pythonStatusLabel.Text.Replace("⏳ ", "").Replace("⬇ ", "").Replace("⚙ ", "").Replace("✓ ", "");
-            }
-            
-            if (!string.IsNullOrEmpty(currentTask))
-            {
-                UpdateCurrentTask(currentTask + ": " + currentStatus);
-            }
-            else if (completed == totalComponents && totalComponents > 0)
-            {
-                UpdateCurrentTask("Installation completed!");
-            }
+
+            UpdateCompletedLabel();
+            RefreshOverallStatusLabel();
         }
 
         private void UpdateCompletedLabel()
@@ -1234,7 +1224,10 @@ namespace VSCodePortableInstaller
                 return;
             }
 
-            completedLabel.Text = "Completed: " + completedComponents + "/" + totalComponents + " components";
+            if (totalComponents > 0)
+                completedLabel.Text = string.Format("Overall Progress: {0}% complete ({1}/{2} ready)", overallProgress.Value, completedComponents, totalComponents);
+            else
+                completedLabel.Text = string.Format("Overall Progress: {0}% complete", overallProgress.Value);
         }
 
         private void UpdateCurrentTask(string message)
@@ -1245,7 +1238,8 @@ namespace VSCodePortableInstaller
                 return;
             }
 
-            currentTaskLabel.Text = message;
+            overallStatusOverride = SimplifyOverallStatusMessage(message);
+            currentTaskLabel.Text = overallStatusOverride;
         }
 
         private void LogActivity(string message, bool fileOnly = false)
@@ -1274,7 +1268,216 @@ namespace VSCodePortableInstaller
                 return;
             }
 
-            activityLog.AppendText(logEntry);
+            string uiMessage = SimplifyActivityMessage(message);
+            if (string.IsNullOrEmpty(uiMessage))
+                return;
+
+            AppendActivityLogEntry("[" + timestamp + "] " + uiMessage);
+        }
+
+        private string FormatElapsedForUi(TimeSpan elapsed)
+        {
+            return string.Format("{0:D2}:{1:D2}", (int)elapsed.TotalMinutes, elapsed.Seconds);
+        }
+
+        private void RefreshOverallStatusLabel()
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action(RefreshOverallStatusLabel));
+                return;
+            }
+
+            if (!string.IsNullOrEmpty(overallStatusOverride))
+            {
+                currentTaskLabel.Text = overallStatusOverride;
+                return;
+            }
+
+            currentTaskLabel.Text = BuildOverallStatusMessage();
+        }
+
+        private string BuildOverallStatusMessage()
+        {
+            var rows = new[]
+            {
+                Tuple.Create("VS Code", vscodeStatusLabel.Text, vscodeProgressBar.Value, 4),
+                Tuple.Create("PowerShell 7", pwshStatusLabel.Text, pwshProgressBar.Value, 3),
+                Tuple.Create("Python", pythonStatusLabel.Text, pythonProgressBar.Value, 2),
+                Tuple.Create("Fonts", fontsStatusLabel.Text, fontsProgressBar.Value, 1)
+            };
+
+            var failed = rows
+                .Where(row => row.Item3 < 100 && string.Equals(row.Item2, "Failed", StringComparison.OrdinalIgnoreCase))
+                .OrderByDescending(row => row.Item4)
+                .FirstOrDefault();
+            if (failed != null)
+                return "Check: one or more components need attention";
+
+            if (completedComponents == totalComponents && totalComponents > 0)
+                return "Done: Portable environment ready";
+
+            if (overallProgress.Value >= 95)
+                return "Now: Finalizing portable setup";
+
+            if (overallProgress.Value > 0)
+                return "Now: Installing components in parallel";
+
+            if (installStarted && !installCompleted)
+                return "Now: Preparing installation";
+
+            return "Ready to install";
+        }
+
+        private string SimplifyOverallStatusMessage(string message)
+        {
+            string normalized = (message ?? "").Trim();
+            if (string.IsNullOrEmpty(normalized))
+                return "Ready to install";
+
+            if (normalized.StartsWith("Now:") || normalized.StartsWith("Done:") || normalized.StartsWith("Check:") || normalized.StartsWith("Queued:"))
+                return normalized;
+
+            if (normalized.IndexOf("Creating installation directory", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "Now: Preparing install directory";
+            if (normalized.IndexOf("Creating configuration files", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "Now: Finalizing portable setup";
+            if (normalized.IndexOf("Cancelling installation", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "Now: Cleaning up cancelled install";
+            if (normalized.IndexOf("Retrying PowerShell 7", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "Now: Retrying installation";
+            if (normalized.IndexOf("Retrying failed components", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "Now: Retrying installation";
+            if (normalized.IndexOf("Installation completed successfully", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                normalized.IndexOf("All components installed successfully", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "Done: Portable environment ready";
+            if (normalized.IndexOf("Installation incomplete", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "Check: one or more components need attention";
+            if (normalized.IndexOf("Retry failed", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "Check: retry failed";
+            if (normalized.IndexOf("Installation error", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "Check: installation error";
+
+            return normalized.TrimStart('✓', '⚠', ' ');
+        }
+
+        private string SimplifyActivityMessage(string message)
+        {
+            string normalized = (message ?? "").Trim();
+            if (string.IsNullOrEmpty(normalized))
+                return null;
+
+            normalized = normalized.Replace("VSCode", "VS Code");
+
+            if (normalized.IndexOf("Stack trace:", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                normalized.IndexOf("Downloaded version info page", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                normalized.IndexOf("Looking for version", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                normalized.IndexOf("Parallel extraction using", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                normalized.IndexOf("Created directory:", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                normalized.IndexOf("pwsh.exe extracted successfully", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                normalized.IndexOf("Skipping recursive unblock", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                normalized.IndexOf("Settings created", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                normalized.IndexOf("Received version info -", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                normalized.IndexOf("pwsh.exe verified successfully", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                normalized.IndexOf("Download verified", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                normalized.IndexOf("CLI detected", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                normalized.IndexOf("Found launcher resource:", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                normalized.IndexOf("Launcher extracted to:", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                normalized.IndexOf("pvs.info created successfully", StringComparison.OrdinalIgnoreCase) >= 0)
+                return null;
+
+            if (Regex.IsMatch(normalized, @"Downloading\.\.\.\s+\d+%", RegexOptions.IgnoreCase) ||
+                Regex.IsMatch(normalized, @"VS Code:\s+\[\d+/\d+\]\s+.+\s+OK$", RegexOptions.IgnoreCase) ||
+                Regex.IsMatch(normalized, @"VS Code:\s+Final retry\s+--\s+.+\.\.\.$", RegexOptions.IgnoreCase) ||
+                Regex.IsMatch(normalized, @"VS Code:\s+Downloading VSIX\s+--", RegexOptions.IgnoreCase))
+                return null;
+
+            if (normalized.StartsWith("=== Installation started at ", StringComparison.OrdinalIgnoreCase) ||
+                normalized.StartsWith("=== Installation completed at ", StringComparison.OrdinalIgnoreCase))
+                return normalized.Trim('=').Trim();
+
+            if (normalized.StartsWith("*** Total installation time:", StringComparison.OrdinalIgnoreCase))
+                return "Total time: " + FormatDurationFromLog(normalized);
+
+            if (normalized.StartsWith("Phase 1A:", StringComparison.OrdinalIgnoreCase))
+                return "Phase 1A: Fonts and Python";
+            if (normalized.StartsWith("Phase 1B:", StringComparison.OrdinalIgnoreCase))
+                return "Phase 1B: VS Code and PowerShell 7";
+
+            var pythonVersionMatch = Regex.Match(normalized, @"^Python:\s+Found version\s+(.+)$", RegexOptions.IgnoreCase);
+            if (pythonVersionMatch.Success)
+                return "Python: Selected " + pythonVersionMatch.Groups[1].Value.Trim();
+
+            var pipVersionMatch = Regex.Match(normalized, @"^Python:\s+Latest pip wheel\s+=\s+(.+)$", RegexOptions.IgnoreCase);
+            if (pipVersionMatch.Success)
+                return "Python: Selected pip " + pipVersionMatch.Groups[1].Value.Trim();
+
+            var pipReadyMatch = Regex.Match(normalized, @"^Python:\s+pip verified\s+-\s+pip\s+([^\s]+)", RegexOptions.IgnoreCase);
+            if (pipReadyMatch.Success)
+                return "Python: pip ready (" + pipReadyMatch.Groups[1].Value.Trim() + ")";
+
+            var powerShellReadyMatch = Regex.Match(normalized, @"^PowerShell 7:\s+Core installation completed\s+-\s+version\s+(.+)$", RegexOptions.IgnoreCase);
+            if (powerShellReadyMatch.Success)
+                return "PowerShell 7: Core ready (" + powerShellReadyMatch.Groups[1].Value.Trim() + ")";
+
+            var genericInstalledMatch = Regex.Match(normalized, @"^(Oh My Posh|Terminal-Icons|PSFzf|modern-unix-win):\s+(Successfully installed version|Installed)\s+(.+)$", RegexOptions.IgnoreCase);
+            if (genericInstalledMatch.Success)
+                return genericInstalledMatch.Groups[1].Value + ": Installed " + genericInstalledMatch.Groups[3].Value.Trim();
+
+            if (normalized.Equals("PowerShell 7: All modules and Oh My Posh installed", StringComparison.OrdinalIgnoreCase))
+                return "PowerShell 7: Add-ons installed";
+            if (normalized.Equals("PowerShell 7: All components installed", StringComparison.OrdinalIgnoreCase))
+                return "PowerShell 7: Ready";
+            if (normalized.Equals("VS Code: Core installation completed", StringComparison.OrdinalIgnoreCase))
+                return "VS Code: Core ready";
+            if (normalized.Equals("VS Code: Installation completed", StringComparison.OrdinalIgnoreCase))
+                return "VS Code: Ready";
+            if (normalized.Equals("VS Code: Installing extensions by direct VSIX extraction...", StringComparison.OrdinalIgnoreCase))
+                return "VS Code: Installing extensions";
+
+            var extensionDownloadMatch = Regex.Match(normalized, @"^VS Code:\s+Downloading latest VSIX packages in parallel for\s+(\d+)\s+extension\(s\)\.\.\.$", RegexOptions.IgnoreCase);
+            if (extensionDownloadMatch.Success)
+                return "VS Code: Downloading " + extensionDownloadMatch.Groups[1].Value + " extensions";
+
+            if (normalized.IndexOf("Waiting for VS Code download to finish before starting addons", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "PowerShell 7: Waiting for VS Code core download";
+            if (normalized.IndexOf("Waiting for VS Code download to finish before installing pip", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "Python: Waiting for VS Code core download";
+            if (normalized.Equals("Creating pvs.info file...", StringComparison.OrdinalIgnoreCase))
+                return "Finalizing setup metadata";
+            if (normalized.Equals("Extracting launcher.exe from embedded resources...", StringComparison.OrdinalIgnoreCase))
+                return "Finalizing launcher";
+
+            return normalized;
+        }
+
+        private string FormatDurationFromLog(string message)
+        {
+            var match = Regex.Match(message, @"(\d{2}):(\d{2}):(\d{2})");
+            if (!match.Success)
+                return message;
+
+            int hours = int.Parse(match.Groups[1].Value);
+            int minutes = int.Parse(match.Groups[2].Value);
+            int seconds = int.Parse(match.Groups[3].Value);
+            return string.Format("{0:D2}:{1:D2}", (hours * 60) + minutes, seconds);
+        }
+
+        private void AppendActivityLogEntry(string entry)
+        {
+            if (string.IsNullOrEmpty(entry))
+                return;
+
+            if (activityDisplayEntries.Count > 0 && activityDisplayEntries.Last() == entry)
+                return;
+
+            activityDisplayEntries.Enqueue(entry);
+            while (activityDisplayEntries.Count > MAX_ACTIVITY_LOG_LINES)
+                activityDisplayEntries.Dequeue();
+
+            activityLog.Lines = activityDisplayEntries.ToArray();
+            activityLog.SelectionStart = activityLog.Text.Length;
+            activityLog.ScrollToCaret();
         }
 
         private void SaveInstallLog()
@@ -1753,6 +1956,27 @@ namespace VSCodePortableInstaller
                 return versions;
             }
 
+            if (!vscodeDownloadCompleted)
+            {
+                UpdateComponentStatus("PowerShell 7", "Waiting for VSCode download...", 60);
+                LogActivity("PowerShell 7: Waiting for VSCode download to finish before starting addons...");
+
+                int waitIterations = 0;
+                while (!vscodeDownloadCompleted && !cancellationToken.IsCancellationRequested && waitIterations < 360)
+                {
+                    await Task.Delay(500, cancellationToken);
+                    waitIterations++;
+                }
+
+                if (vscodeDownloadCompleted)
+                {
+                    UpdateComponentStatus("PowerShell 7", "Starting addons...", 60);
+                    LogActivity("PowerShell 7: VSCode download finished; starting addons");
+                }
+                else if (!cancellationToken.IsCancellationRequested)
+                    LogActivity("PowerShell 7: VSCode download wait timed out; starting addons anyway");
+            }
+
             LogActivity("PowerShell 7: Starting modules and Oh My Posh in parallel...");
             UpdateComponentStatus("PowerShell 7", "Installing modules...", 60);
 
@@ -1817,7 +2041,7 @@ namespace VSCodePortableInstaller
                 LogActivity("VSCode: Checking latest version...");
 
                 string version = "";
-                string downloadUrl = "";
+                string downloadUrl = VSCODE_LATEST_DOWNLOAD_URL;
 
                 using (var versionClient = new HttpClient(new HttpClientHandler { AllowAutoRedirect = false }))
                 {
@@ -1840,15 +2064,14 @@ namespace VSCodePortableInstaller
                         var match = Regex.Match(location, @"VSCode-win32-x64-([\d\.]+)\.zip");
                         if (!match.Success)
                         {
-                            vscodeDownloadCompleted = true;
-                            UpdateComponentStatus(componentName, "⚠ Version not found", 0);
-                            LogActivity("VSCode: Could not determine version from redirect");
-                            return versions;
+                            LogActivity("VSCode: Could not determine version from redirect, falling back to latest download URL");
                         }
-
-                        version = match.Groups[1].Value;
-                        downloadUrl = "https://update.code.visualstudio.com/" + version + "/win32-x64-archive/stable";
-                        LogActivity("VSCode: Version = " + version);
+                        else
+                        {
+                            version = match.Groups[1].Value;
+                            downloadUrl = "https://update.code.visualstudio.com/" + version + "/win32-x64-archive/stable";
+                            LogActivity("VSCode: Version = " + version);
+                        }
                     }
                 }
 
@@ -1867,17 +2090,39 @@ namespace VSCodePortableInstaller
                 string zipPath = Path.Combine(tempDir, "vscode.zip");
 
                 UpdateComponentStatus(componentName, "Downloading...", 10);
-                LogActivity("VSCode: Downloading version " + version + "...");
+                if (!string.IsNullOrEmpty(version))
+                    LogActivity("VSCode: Downloading version " + version + "...");
+                else
+                    LogActivity("VSCode: Downloading latest stable archive...");
 
-                using (var client = new HttpClient())
+                bool downloadSucceeded = false;
+                for (int attempt = 1; attempt <= VSCODE_DOWNLOAD_RETRY_COUNT && !downloadSucceeded; attempt++)
                 {
-                    client.Timeout = TimeSpan.FromMinutes(MAX_DOWNLOAD_TIMEOUT_MINUTES);
-                    client.DefaultRequestHeaders.ConnectionClose = false;
-                    client.DefaultRequestHeaders.Add("User-Agent", "VSCode-Portable-Installer");
-                    await DownloadFileWithProgress(client, downloadUrl, zipPath, componentName, 10, 55, cancellationToken);
+                    if (attempt > 1)
+                    {
+                        LogActivity("VSCode: Retrying download (attempt " + attempt + "/" + VSCODE_DOWNLOAD_RETRY_COUNT + ")...");
+                        try { if (File.Exists(zipPath)) File.Delete(zipPath); } catch { }
+                    }
+
+                    using (var client = new HttpClient())
+                    {
+                        client.Timeout = TimeSpan.FromMinutes(MAX_DOWNLOAD_TIMEOUT_MINUTES);
+                        client.DefaultRequestHeaders.ConnectionClose = false;
+                        client.DefaultRequestHeaders.Add("User-Agent", "VSCode-Portable-Installer");
+
+                        try
+                        {
+                            await DownloadFileWithProgress(client, downloadUrl, zipPath, componentName, 10, 55, cancellationToken);
+                            downloadSucceeded = File.Exists(zipPath) && new FileInfo(zipPath).Length >= 1000000;
+                        }
+                        catch (Exception ex)
+                        {
+                            LogActivity("VSCode: Download attempt " + attempt + " failed - " + ex.Message);
+                        }
+                    }
                 }
 
-                if (!File.Exists(zipPath) || new FileInfo(zipPath).Length < 1000000)
+                if (!downloadSucceeded)
                 {
                     vscodeDownloadCompleted = true;
                     LogActivity("VSCode: Download file missing or too small (" + (File.Exists(zipPath) ? new FileInfo(zipPath).Length + " bytes" : "not found") + ")");
@@ -1905,6 +2150,9 @@ namespace VSCodePortableInstaller
                 if (Directory.Exists(tempDir))
                     Directory.Delete(tempDir, true);
 
+                if (string.IsNullOrEmpty(version))
+                    version = DetectInstalledVSCodeVersion();
+
                 UpdateComponentStatus(componentName, "Core installed", 80);
                 LogActivity("VSCode: Core installation completed");
                 versions["VSCODE_VERSION"] = version;
@@ -1921,6 +2169,25 @@ namespace VSCodePortableInstaller
             }
 
             return versions;
+        }
+
+        private string DetectInstalledVSCodeVersion()
+        {
+            try
+            {
+                string codeExe = Path.Combine(installDir, "Code.exe");
+                if (!File.Exists(codeExe))
+                    return "latest";
+
+                var info = FileVersionInfo.GetVersionInfo(codeExe);
+                if (!string.IsNullOrEmpty(info.ProductVersion))
+                    return info.ProductVersion;
+                if (!string.IsNullOrEmpty(info.FileVersion))
+                    return info.FileVersion;
+            }
+            catch { }
+
+            return "latest";
         }
 
         private async Task<Dictionary<string, string>> InstallVSCodeExtensionsAsync(System.Threading.CancellationToken cancellationToken)
@@ -2105,54 +2372,42 @@ namespace VSCodePortableInstaller
                     Directory.Delete(pipTempDir, true);
                 Directory.CreateDirectory(pipTempDir);
 
-                string getPipPath = Path.Combine(pipTempDir, "get-pip.py");
-
-                using (var client = new HttpClient())
+                bool pipInstalled = false;
+                if (IsPythonVersionAtLeast(version, 3, 9))
                 {
-                    client.Timeout = TimeSpan.FromMinutes(MAX_DOWNLOAD_TIMEOUT_MINUTES);
-                    client.DefaultRequestHeaders.ConnectionClose = false;
-                    var getPipContent = await client.GetStringAsync(BOOTSTRAP_PIP_URL);
-                    File.WriteAllText(getPipPath, getPipContent, Encoding.UTF8);
+                    try
+                    {
+                        pipInstalled = await TryInstallLatestPipWheelAsync(version, pythonExe, pythonDir, pipTempDir, componentName, cancellationToken);
+                    }
+                    catch (Exception ex)
+                    {
+                        LogActivity("Python: Latest pip wheel install failed, falling back to get-pip.py - " + ex.Message);
+                    }
+                }
+                else
+                {
+                    LogActivity("Python: Python " + version + " is below 3.9; falling back to get-pip.py for compatibility");
                 }
 
-                UpdateComponentStatus(componentName, "Running get-pip.py...", 96);
-
-                if (File.Exists(getPipPath))
+                if (!pipInstalled)
                 {
-                    var psi = new ProcessStartInfo
-                    {
-                        FileName = pythonExe,
-                        Arguments = "\"" + getPipPath + "\" --no-warn-script-location",
-                        UseShellExecute = false,
-                        CreateNoWindow = true,
-                        WorkingDirectory = pipTempDir,
-                        RedirectStandardOutput = true,
-                        RedirectStandardError = true
-                    };
-
-                    using (var process = Process.Start(psi))
-                    {
-                        process.WaitForExit(120000);
-                    }
-
-                    UpdateComponentStatus(componentName, "Cleaning Scripts...", 97);
-
-                    string scriptsDir = Path.Combine(pythonDir, "Scripts");
-                    if (Directory.Exists(scriptsDir))
-                    {
-                        foreach (var exeFile in Directory.GetFiles(scriptsDir, "*.exe"))
-                        {
-                            try { File.Delete(exeFile); } catch { }
-                        }
-                    }
-
-                    UpdateComponentStatus(componentName, "Creating pip.cmd...", 98);
-
-                    string pipCmd = Path.Combine(pythonDir, "pip.cmd");
-                    string pipCmdContent = "@echo off\r\n\"%~dp0python.exe\" -m pip %*\r\n";
-                    File.WriteAllText(pipCmd, pipCmdContent, Encoding.ASCII);
-                    LogActivity("Python: pip.cmd created");
+                    UpdateComponentStatus(componentName, "Running get-pip.py...", 96);
+                    pipInstalled = await InstallPipWithGetPipAsync(pythonExe, pipTempDir, componentName, cancellationToken);
                 }
+
+                if (!pipInstalled)
+                {
+                    UpdateComponentStatus(componentName, "⚠ pip installation failed", 0);
+                    LogActivity("Python: FAILED - pip installation did not complete successfully");
+                    return versions;
+                }
+
+                UpdateComponentStatus(componentName, "Cleaning Scripts...", 97);
+                CleanupPythonScripts(pythonDir);
+
+                UpdateComponentStatus(componentName, "Creating pip.cmd...", 98);
+                CreatePipCommandShim(pythonDir);
+                LogActivity("Python: pip.cmd created");
 
                 if (Directory.Exists(pipTempDir))
                     Directory.Delete(pipTempDir, true);
@@ -2172,6 +2427,217 @@ namespace VSCodePortableInstaller
             }
 
             return versions;
+        }
+
+        private async Task<bool> TryInstallLatestPipWheelAsync(string pythonVersion, string pythonExe, string pythonDir, string pipTempDir,
+            string componentName, System.Threading.CancellationToken cancellationToken)
+        {
+            LogActivity("Python: Resolving latest pip wheel from PyPI...");
+            var pipInfo = await GetLatestPipWheelInfoAsync(cancellationToken);
+            if (string.IsNullOrEmpty(pipInfo.Item1) || string.IsNullOrEmpty(pipInfo.Item2))
+            {
+                LogActivity("Python: Could not resolve latest pip wheel metadata");
+                return false;
+            }
+
+            string pipVersion = pipInfo.Item1;
+            string wheelUrl = pipInfo.Item2;
+            string wheelPath = Path.Combine(pipTempDir, "pip-" + pipVersion + ".whl");
+            string sitePackagesDir = Path.Combine(pythonDir, "Lib", "site-packages");
+
+            Directory.CreateDirectory(sitePackagesDir);
+
+            LogActivity("Python: Latest pip wheel = " + pipVersion);
+            using (var client = new HttpClient())
+            {
+                client.Timeout = TimeSpan.FromMinutes(MAX_DOWNLOAD_TIMEOUT_MINUTES);
+                client.DefaultRequestHeaders.ConnectionClose = false;
+                client.DefaultRequestHeaders.Add("User-Agent", "VSCode-Portable-Installer");
+                await DownloadFileWithProgress(client, wheelUrl, wheelPath, componentName, 94, 96, cancellationToken);
+            }
+
+            if (!File.Exists(wheelPath) || new FileInfo(wheelPath).Length < 100000)
+            {
+                LogActivity("Python: Latest pip wheel download missing or too small");
+                return false;
+            }
+
+            UpdateComponentStatus(componentName, "Extracting pip wheel...", 96);
+            LogActivity("Python: Extracting latest pip wheel...");
+            await ExtractZipWithProgress(wheelPath, sitePackagesDir, componentName, 96, 97, cancellationToken);
+
+            UpdateComponentStatus(componentName, "Verifying pip...", 97);
+            bool verified = await VerifyPipInstallationAsync(pythonExe, pipTempDir, pipVersion);
+            if (!verified)
+            {
+                LogActivity("Python: Latest pip wheel verification failed");
+                return false;
+            }
+
+            LogActivity("Python: Installed latest pip wheel " + pipVersion);
+            return true;
+        }
+
+        private async Task<bool> InstallPipWithGetPipAsync(string pythonExe, string pipTempDir, string componentName,
+            System.Threading.CancellationToken cancellationToken)
+        {
+            string getPipPath = Path.Combine(pipTempDir, "get-pip.py");
+
+            LogActivity("Python: Downloading get-pip.py fallback...");
+            using (var client = new HttpClient())
+            {
+                client.Timeout = TimeSpan.FromMinutes(MAX_DOWNLOAD_TIMEOUT_MINUTES);
+                client.DefaultRequestHeaders.ConnectionClose = false;
+                var getPipContent = await client.GetStringAsync(BOOTSTRAP_PIP_URL);
+                File.WriteAllText(getPipPath, getPipContent, Encoding.UTF8);
+            }
+
+            if (!File.Exists(getPipPath))
+            {
+                LogActivity("Python: get-pip.py fallback file was not created");
+                return false;
+            }
+
+            LogActivity("Python: Running get-pip.py fallback...");
+            var psi = new ProcessStartInfo
+            {
+                FileName = pythonExe,
+                Arguments = "\"" + getPipPath + "\" --no-warn-script-location",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WorkingDirectory = pipTempDir,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+
+            using (var process = Process.Start(psi))
+            {
+                if (!process.WaitForExit(120000))
+                {
+                    try { process.Kill(); } catch { }
+                    LogActivity("Python: get-pip.py fallback timed out");
+                    return false;
+                }
+
+                string output = await process.StandardOutput.ReadToEndAsync();
+                string error = await process.StandardError.ReadToEndAsync();
+
+                if (process.ExitCode != 0)
+                {
+                    if (!string.IsNullOrEmpty(error))
+                        LogActivity("Python: get-pip.py stderr: " + error.Trim());
+                    if (!string.IsNullOrEmpty(output))
+                        LogActivity("Python: get-pip.py stdout: " + output.Trim());
+                    return false;
+                }
+            }
+
+            return await VerifyPipInstallationAsync(pythonExe, pipTempDir, "");
+        }
+
+        private async Task<Tuple<string, string>> GetLatestPipWheelInfoAsync(System.Threading.CancellationToken cancellationToken)
+        {
+            using (var client = new HttpClient())
+            {
+                client.Timeout = TimeSpan.FromMinutes(MAX_DOWNLOAD_TIMEOUT_MINUTES);
+                client.DefaultRequestHeaders.ConnectionClose = false;
+                client.DefaultRequestHeaders.Add("User-Agent", "VSCode-Portable-Installer");
+
+                string json = await client.GetStringAsync("https://pypi.org/pypi/pip/json");
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var versionMatch = Regex.Match(json, "\\\"version\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"");
+                if (!versionMatch.Success)
+                    return Tuple.Create("", "");
+
+                string pipVersion = versionMatch.Groups[1].Value;
+                string wheelPattern = "\\\"filename\\\"\\s*:\\s*\\\"pip-" + Regex.Escape(pipVersion) + "-py3-none-any\\.whl\\\".*?\\\"url\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"";
+                var wheelMatch = Regex.Match(json, wheelPattern, RegexOptions.Singleline);
+                if (!wheelMatch.Success)
+                    return Tuple.Create("", "");
+
+                return Tuple.Create(pipVersion, wheelMatch.Groups[1].Value);
+            }
+        }
+
+        private async Task<bool> VerifyPipInstallationAsync(string pythonExe, string workingDirectory, string expectedVersion)
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = pythonExe,
+                Arguments = "-m pip --version",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WorkingDirectory = workingDirectory,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+
+            using (var process = Process.Start(psi))
+            {
+                if (!process.WaitForExit(30000))
+                {
+                    try { process.Kill(); } catch { }
+                    LogActivity("Python: pip verification timed out");
+                    return false;
+                }
+
+                string output = await process.StandardOutput.ReadToEndAsync();
+                string error = await process.StandardError.ReadToEndAsync();
+
+                if (process.ExitCode != 0)
+                {
+                    if (!string.IsNullOrEmpty(error))
+                        LogActivity("Python: pip verification stderr: " + error.Trim());
+                    return false;
+                }
+
+                string trimmedOutput = string.IsNullOrEmpty(output) ? "" : output.Trim();
+                if (!string.IsNullOrEmpty(expectedVersion) && trimmedOutput.IndexOf(expectedVersion, StringComparison.OrdinalIgnoreCase) < 0)
+                {
+                    LogActivity("Python: pip verification returned unexpected version - " + trimmedOutput);
+                    return false;
+                }
+
+                LogActivity("Python: pip verified - " + trimmedOutput);
+                return true;
+            }
+        }
+
+        private bool IsPythonVersionAtLeast(string version, int requiredMajor, int requiredMinor)
+        {
+            var match = Regex.Match(version ?? "", @"^(\d+)\.(\d+)");
+            if (!match.Success)
+                return false;
+
+            int major;
+            int minor;
+            if (!int.TryParse(match.Groups[1].Value, out major) || !int.TryParse(match.Groups[2].Value, out minor))
+                return false;
+
+            if (major > requiredMajor)
+                return true;
+
+            return major == requiredMajor && minor >= requiredMinor;
+        }
+
+        private void CleanupPythonScripts(string pythonDir)
+        {
+            string scriptsDir = Path.Combine(pythonDir, "Scripts");
+            if (!Directory.Exists(scriptsDir))
+                return;
+
+            foreach (var exeFile in Directory.GetFiles(scriptsDir, "*.exe"))
+            {
+                try { File.Delete(exeFile); } catch { }
+            }
+        }
+
+        private void CreatePipCommandShim(string pythonDir)
+        {
+            string pipCmd = Path.Combine(pythonDir, "pip.cmd");
+            string pipCmdContent = "@echo off\r\n\"%~dp0python.exe\" -m pip %*\r\n";
+            File.WriteAllText(pipCmd, pipCmdContent, Encoding.ASCII);
         }
 
         private async Task<KeyValuePair<string, string>> InstallPowerShell7(System.Threading.CancellationToken cancellationToken)
@@ -2319,13 +2785,11 @@ namespace VSCodePortableInstaller
                         cliJs = cliCandidates[0];
                 }
 
-                if (!File.Exists(codeExe) || !File.Exists(cliJs))
-                {
-                    LogActivity("VSCode: CLI tools not found, skipping extensions");
-                    return;
-                }
-
-                LogActivity("VSCode: CLI detected -- Code=" + codeExe + ", cli.js=" + cliJs);
+                bool cliAvailable = File.Exists(codeExe) && File.Exists(cliJs);
+                if (cliAvailable)
+                    LogActivity("VSCode: CLI detected -- Code=" + codeExe + ", cli.js=" + cliJs + " (fallback available)");
+                else
+                    LogActivity("VSCode: CLI tools not found; using direct extraction only");
 
                 // Use absolute paths to avoid resolution issues
                 string extensionsDir = Path.Combine(installDir, "data", "extensions");
@@ -2352,24 +2816,31 @@ namespace VSCodePortableInstaller
                 int installed = 0;
                 int total = extensions.Count;
                 var failedExtensions = new List<string>();
-                UpdateComponentStatus(componentName, "Installing extensions (batch)...", 82);
-                LogActivity("VSCode: Starting batch install for " + total + " extension(s)...");
+                string tempVsixDir = Path.Combine(Path.GetTempPath(), TEMP_INSTALL_DIR, "vsix-cache");
+                if (Directory.Exists(tempVsixDir))
+                {
+                    try { Directory.Delete(tempVsixDir, true); }
+                    catch { }
+                }
+                Directory.CreateDirectory(tempVsixDir);
 
-                string batchArguments = BuildVSCodeExtensionInstallArguments(cliJs, extensionsDir, userDataDir, extensions);
-                var batchResult = await RunVSCodeCliProcess(codeExe, batchArguments, 600000);
-                if (!batchResult.Item4)
-                {
-                    LogActivity("VSCode: Batch install timed out; missing extensions will be retried individually");
-                }
-                else if (batchResult.Item1 != 0)
-                {
-                    string errSnip = string.IsNullOrEmpty(batchResult.Item3) ? "" : " -- " + batchResult.Item3.Substring(0, Math.Min(160, batchResult.Item3.Length)).Trim();
-                    LogActivity("VSCode: Batch install exited with code " + batchResult.Item1 + errSnip);
-                }
+                UpdateComponentStatus(componentName, "Downloading extensions...", 82);
+                LogActivity("VSCode: Downloading latest VSIX packages in parallel for " + total + " extension(s)...");
+                var downloadedPackages = await DownloadVSCodeExtensionPackagesAsync(extensions, tempVsixDir, componentName);
+
+                UpdateComponentStatus(componentName, "Installing extensions (local)...", 86);
+                LogActivity("VSCode: Installing extensions by direct VSIX extraction...");
 
                 foreach (var ext in extensions)
                 {
-                    bool success = IsVSCodeExtensionInstalled(extensionsDir, ext);
+                    bool success = false;
+                    string localPackagePath;
+                    if (downloadedPackages.TryGetValue(ext, out localPackagePath))
+                        success = TryExtractVSCodeExtensionPackage(localPackagePath, extensionsDir, ext);
+
+                    if (!success)
+                        success = IsVSCodeExtensionInstalled(extensionsDir, ext);
+
                     if (!success)
                         failedExtensions.Add(ext);
 
@@ -2382,51 +2853,62 @@ namespace VSCodePortableInstaller
                 // Final retry pass for failed extensions after network recovery delay
                 if (failedExtensions.Count > 0)
                 {
-                    LogActivity("VSCode: Retrying " + failedExtensions.Count + " missing extension(s)...");
-                    await Task.Delay(1500);
-
-                    var stillFailed = new List<string>();
-                    foreach (var ext in failedExtensions)
+                    if (cliAvailable)
                     {
-                        bool success = false;
+                        LogActivity("VSCode: Retrying " + failedExtensions.Count + " missing extension(s) via CLI...");
+                        await Task.Delay(1500);
 
-                        try
+                        var stillFailed = new List<string>();
+                        foreach (var ext in failedExtensions)
                         {
-                            LogActivity("VSCode: Final retry -- " + ext + "...");
+                            bool success = false;
 
-                            string retryArguments = BuildVSCodeExtensionInstallArguments(cliJs, extensionsDir, userDataDir, new[] { ext });
-                            var retryResult = await RunVSCodeCliProcess(codeExe, retryArguments, 600000);
-                            bool isInstalled = IsVSCodeExtensionInstalled(extensionsDir, ext);
+                            try
+                            {
+                                LogActivity("VSCode: Final retry -- " + ext + "...");
 
-                            if (isInstalled || (retryResult.Item4 && retryResult.Item1 == 0))
-                            {
-                                success = true;
-                                LogActivity("VSCode: Final retry -- " + ext + " OK");
+                                string retryInput;
+                                if (!downloadedPackages.TryGetValue(ext, out retryInput))
+                                    retryInput = ext;
+
+                                string retryArguments = BuildVSCodeExtensionInstallArguments(cliJs, extensionsDir, userDataDir, new[] { retryInput });
+                                var retryResult = await RunVSCodeCliProcess(codeExe, retryArguments, 600000);
+                                bool isInstalled = IsVSCodeExtensionInstalled(extensionsDir, ext);
+
+                                if (isInstalled || (retryResult.Item4 && retryResult.Item1 == 0))
+                                {
+                                    success = true;
+                                    LogActivity("VSCode: Final retry -- " + ext + " OK");
+                                }
+                                else
+                                {
+                                    LogActivity("VSCode: Final retry -- " + ext + " FAILED");
+                                }
                             }
-                            else
+                            catch (Exception ex)
                             {
-                                LogActivity("VSCode: Final retry -- " + ext + " FAILED");
+                                LogActivity("VSCode: Final retry exception for " + ext + " -- " + ex.Message);
                             }
+
+                            if (!success)
+                                stillFailed.Add(ext);
+
+                            await Task.Delay(300);
                         }
-                        catch (Exception ex)
+
+                        if (stillFailed.Count > 0)
                         {
-                            LogActivity("VSCode: Final retry exception for " + ext + " -- " + ex.Message);
+                            LogActivity("VSCode: " + stillFailed.Count + " extension(s) could not be installed: " + string.Join(", ", stillFailed));
+                            LogActivity("VSCode: These can be installed manually from within VS Code");
                         }
-
-                        if (!success)
-                            stillFailed.Add(ext);
-
-                        await Task.Delay(300);
-                    }
-
-                    if (stillFailed.Count > 0)
-                    {
-                        LogActivity("VSCode: " + stillFailed.Count + " extension(s) could not be installed: " + string.Join(", ", stillFailed));
-                        LogActivity("VSCode: These can be installed manually from within VS Code");
+                        else
+                        {
+                            LogActivity("VSCode: All previously failed extensions recovered successfully");
+                        }
                     }
                     else
                     {
-                        LogActivity("VSCode: All previously failed extensions recovered successfully");
+                        LogActivity("VSCode: " + failedExtensions.Count + " extension(s) failed direct extraction and CLI fallback is unavailable");
                     }
                 }
 
@@ -2437,6 +2919,11 @@ namespace VSCodePortableInstaller
                 if (File.Exists(extensionsJsonPath))
                 {
                     try { File.Delete(extensionsJsonPath); } catch { }
+                }
+
+                if (Directory.Exists(tempVsixDir))
+                {
+                    try { Directory.Delete(tempVsixDir, true); } catch { }
                 }
             }
             catch (Exception ex)
@@ -2453,10 +2940,240 @@ namespace VSCodePortableInstaller
             args.Append(" --user-data-dir \"").Append(userDataDir).Append("\"");
 
             foreach (var ext in extensions)
-                args.Append(" --install-extension ").Append(ext);
+                args.Append(" --install-extension \"").Append(ext).Append("\"");
 
             args.Append(" --force");
             return args.ToString();
+        }
+
+        private bool TryExtractVSCodeExtensionPackage(string vsixPath, string extensionsDir, string extensionId)
+        {
+            try
+            {
+                Tuple<string, string, string> packageInfo;
+                using (var archive = ZipFile.OpenRead(vsixPath))
+                {
+                    packageInfo = ReadVSCodeExtensionPackageInfo(archive, extensionId);
+                    if (packageInfo == null)
+                    {
+                        LogActivity("VSCode: Extension metadata parse failed -- " + extensionId);
+                        return false;
+                    }
+
+                    string destinationDir = Path.Combine(extensionsDir, packageInfo.Item1 + "." + packageInfo.Item2 + "-" + packageInfo.Item3);
+                    if (Directory.Exists(destinationDir))
+                    {
+                        try { Directory.Delete(destinationDir, true); } catch { }
+                    }
+                    Directory.CreateDirectory(destinationDir);
+
+                    foreach (var entry in archive.Entries)
+                    {
+                        if (!entry.FullName.StartsWith("extension/", StringComparison.OrdinalIgnoreCase))
+                            continue;
+
+                        string relativePath = entry.FullName.Substring("extension/".Length);
+                        if (string.IsNullOrEmpty(relativePath))
+                            continue;
+
+                        string destinationPath = GetSafeExtractionDestination(destinationDir, relativePath);
+                        if (destinationPath == null)
+                            continue;
+
+                        if (string.IsNullOrEmpty(entry.Name))
+                        {
+                            Directory.CreateDirectory(destinationPath);
+                            continue;
+                        }
+
+                        string destinationParent = Path.GetDirectoryName(destinationPath);
+                        if (!string.IsNullOrEmpty(destinationParent))
+                            Directory.CreateDirectory(destinationParent);
+
+                        using (var input = entry.Open())
+                        using (var output = new FileStream(destinationPath, FileMode.Create, FileAccess.Write, FileShare.None, EXTRACT_BUFFER_SIZE, false))
+                        {
+                            input.CopyTo(output, EXTRACT_BUFFER_SIZE);
+                        }
+                    }
+                }
+
+                bool installed = IsVSCodeExtensionInstalled(extensionsDir, extensionId);
+                if (!installed)
+                    LogActivity("VSCode: Direct extraction verification failed -- " + extensionId);
+                return installed;
+            }
+            catch (Exception ex)
+            {
+                LogActivity("VSCode: Direct extraction failed -- " + extensionId + " -- " + ex.Message);
+                return false;
+            }
+        }
+
+        private Tuple<string, string, string> ReadVSCodeExtensionPackageInfo(ZipArchive archive, string extensionId)
+        {
+            var packageEntry = archive.GetEntry("extension/package.json");
+            if (packageEntry == null)
+                return null;
+
+            using (var reader = new StreamReader(packageEntry.Open()))
+            {
+                string packageJson = reader.ReadToEnd();
+                string publisher = Regex.Match(packageJson, "\"publisher\"\\s*:\\s*\"([^\"]+)\"", RegexOptions.IgnoreCase).Groups[1].Value;
+                string name = Regex.Match(packageJson, "\"name\"\\s*:\\s*\"([^\"]+)\"", RegexOptions.IgnoreCase).Groups[1].Value;
+                string version = Regex.Match(packageJson, "\"version\"\\s*:\\s*\"([^\"]+)\"", RegexOptions.IgnoreCase).Groups[1].Value;
+
+                if (string.IsNullOrEmpty(publisher) || string.IsNullOrEmpty(name) || string.IsNullOrEmpty(version))
+                {
+                    if (!string.IsNullOrEmpty(extensionId))
+                    {
+                        int dotIndex = extensionId.IndexOf('.');
+                        if (dotIndex > 0 && dotIndex < extensionId.Length - 1)
+                        {
+                            if (string.IsNullOrEmpty(publisher))
+                                publisher = extensionId.Substring(0, dotIndex);
+                            if (string.IsNullOrEmpty(name))
+                                name = extensionId.Substring(dotIndex + 1);
+                        }
+                    }
+                }
+
+                if (string.IsNullOrEmpty(publisher) || string.IsNullOrEmpty(name) || string.IsNullOrEmpty(version))
+                    return null;
+
+                return Tuple.Create(publisher, name, version);
+            }
+        }
+
+        private string GetSafeExtractionDestination(string rootPath, string relativePath)
+        {
+            string fullRoot = Path.GetFullPath(rootPath);
+            if (!fullRoot.EndsWith(Path.DirectorySeparatorChar.ToString(), StringComparison.Ordinal))
+                fullRoot += Path.DirectorySeparatorChar;
+
+            string fullPath = Path.GetFullPath(Path.Combine(fullRoot, relativePath));
+            if (!fullPath.StartsWith(fullRoot, StringComparison.OrdinalIgnoreCase))
+                return null;
+
+            return fullPath;
+        }
+
+        private async Task<Dictionary<string, string>> DownloadVSCodeExtensionPackagesAsync(IList<string> extensions, string tempVsixDir, string componentName)
+        {
+            var results = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var resultLock = new object();
+            var semaphore = new System.Threading.SemaphoreSlim(VSCODE_EXTENSION_DOWNLOAD_CONCURRENCY, VSCODE_EXTENSION_DOWNLOAD_CONCURRENCY);
+            int completed = 0;
+            int total = extensions.Count;
+
+            var handler = new HttpClientHandler
+            {
+                AutomaticDecompression = System.Net.DecompressionMethods.GZip | System.Net.DecompressionMethods.Deflate
+            };
+
+            using (var client = new HttpClient(handler))
+            {
+                client.Timeout = TimeSpan.FromMinutes(MAX_DOWNLOAD_TIMEOUT_MINUTES);
+                client.DefaultRequestHeaders.ConnectionClose = false;
+                client.DefaultRequestHeaders.Add("User-Agent", "VSCode-Portable-Installer");
+
+                var downloadTasks = extensions.Select(async ext =>
+                {
+                    await semaphore.WaitAsync();
+                    try
+                    {
+                        string packageUrl = BuildVSCodeMarketplaceVsixUrl(ext);
+                        if (string.IsNullOrEmpty(packageUrl))
+                        {
+                            LogActivity("VSCode: VSIX URL build failed -- " + ext);
+                            return;
+                        }
+
+                        string vsixPath = Path.Combine(tempVsixDir, ext.Replace('.', '_') + ".vsix");
+                        LogActivity("VSCode: Downloading VSIX -- " + ext);
+
+                        using (var response = await client.GetAsync(packageUrl, HttpCompletionOption.ResponseHeadersRead))
+                        {
+                            response.EnsureSuccessStatusCode();
+                            using (var contentStream = await response.Content.ReadAsStreamAsync())
+                            using (var fileStream = new FileStream(vsixPath, FileMode.Create, FileAccess.Write, FileShare.None, DOWNLOAD_BUFFER_SIZE, true))
+                            {
+                                await contentStream.CopyToAsync(fileStream);
+                            }
+                        }
+
+                        if (File.Exists(vsixPath) && new FileInfo(vsixPath).Length > 0)
+                        {
+                            if (IsValidZipArchive(vsixPath))
+                            {
+                                lock (resultLock)
+                                {
+                                    results[ext] = vsixPath;
+                                }
+                            }
+                            else
+                            {
+                                LogActivity("VSCode: VSIX validation failed -- " + ext + " -- downloaded file is not a valid zip archive");
+                            }
+                        }
+                        else
+                        {
+                            LogActivity("VSCode: VSIX download produced empty file -- " + ext);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        LogActivity("VSCode: VSIX download failed -- " + ext + " -- " + ex.Message);
+                    }
+                    finally
+                    {
+                        int currentCompleted;
+                        lock (resultLock)
+                        {
+                            completed++;
+                            currentCompleted = completed;
+                        }
+
+                        int progress = 82 + (int)(4.0 * currentCompleted / total);
+                        UpdateComponentStatus(componentName, "Downloading extensions (" + currentCompleted + "/" + total + ")...", progress);
+                        semaphore.Release();
+                    }
+                }).ToArray();
+
+                await Task.WhenAll(downloadTasks);
+            }
+
+            LogActivity("VSCode: Downloaded " + results.Count + "/" + total + " VSIX package(s)");
+            return results;
+        }
+
+        private bool IsValidZipArchive(string archivePath)
+        {
+            try
+            {
+                using (var archive = ZipFile.OpenRead(archivePath))
+                {
+                    return archive.Entries.Count > 0;
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private string BuildVSCodeMarketplaceVsixUrl(string extensionId)
+        {
+            if (string.IsNullOrEmpty(extensionId))
+                return "";
+
+            int separatorIndex = extensionId.IndexOf('.');
+            if (separatorIndex <= 0 || separatorIndex >= extensionId.Length - 1)
+                return "";
+
+            string publisher = extensionId.Substring(0, separatorIndex);
+            string extensionName = extensionId.Substring(separatorIndex + 1);
+            return string.Format(VSCODE_MARKETPLACE_VSIX_URL_TEMPLATE, publisher, extensionName);
         }
 
         private bool IsVSCodeExtensionInstalled(string extensionsDir, string extensionId)
@@ -2820,48 +3537,6 @@ namespace VSCodePortableInstaller
                     }
                 }
             });
-        }
-
-        private void CopyDirectoryRecursive(string sourceDir, string targetDir, bool overwrite)
-        {
-            Directory.CreateDirectory(targetDir);
-
-            // Copy files in parallel for better performance
-            var files = Directory.GetFiles(sourceDir);
-            System.Threading.Tasks.Parallel.ForEach(files, file =>
-            {
-                string fileName = Path.GetFileName(file);
-                string destFile = Path.Combine(targetDir, fileName);
-                File.Copy(file, destFile, overwrite);
-            });
-
-            // Process subdirectories recursively
-            foreach (var dir in Directory.GetDirectories(sourceDir))
-            {
-                string dirName = Path.GetFileName(dir);
-                string destDir = Path.Combine(targetDir, dirName);
-                CopyDirectoryRecursive(dir, destDir, overwrite);
-            }
-        }
-
-        private void UnblockFiles(string directory)
-        {
-            try
-            {
-                var psi = new ProcessStartInfo
-                {
-                    FileName = "powershell",
-                    Arguments = "-NoProfile -Command \"Get-ChildItem -Path '" + directory + "' -Recurse | Unblock-File\"",
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                };
-
-                using (var process = Process.Start(psi))
-                {
-                    process.WaitForExit(30000);
-                }
-            }
-            catch { }
         }
 
         private async Task CreatePvsInfo(Dictionary<string, string> versions)

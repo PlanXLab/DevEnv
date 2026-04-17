@@ -23,10 +23,7 @@ namespace VSCodePortableLauncher
     private const int WS_BORDER = 0x00800000;
 
         // Constants
-        private const int FORM_WIDTH = 800;
-        private const int FORM_HEIGHT = 720;
-        private const int TABLE_HEIGHT = 270;
-        private const int LOG_HEIGHT = 230;
+        private const int MAX_ACTIVITY_LOG_LINES = 20;
 
         // VSCode extensions (must match installer)
         public static readonly string[] VSCODE_EXTENSIONS = new string[]
@@ -44,8 +41,6 @@ namespace VSCodePortableLauncher
         // Win32 API for extracting icon from exe
         [System.Runtime.InteropServices.DllImport("shell32.dll", CharSet = System.Runtime.InteropServices.CharSet.Auto)]
         static extern IntPtr ExtractIcon(IntPtr hInst, string lpszExeFileName, int nIconIndex);
-        private Button upgradeButton;
-        private Button cancelButton;
 
         private string pvsDir;
         private string pvsInfo;
@@ -53,10 +48,16 @@ namespace VSCodePortableLauncher
         private Dictionary<string, string> versions;
         private bool upgradeCompleted;
         private bool upgradeStarted;
+        private int totalComponents;
+        private int completedComponents;
         private Stopwatch upgradeTimer;
         private DateTime upgradeStartTime;
         private List<string> pendingUpgrades;
         private System.Windows.Forms.Timer elapsedTimer;
+        private StringBuilder logFileBuffer;
+        private object logFileLock;
+        private Queue<string> activityDisplayEntries;
+        private string overallStatusOverride;
 
         public UpgradeForm(string installDir, List<string> upgrades)
         {
@@ -65,8 +66,14 @@ namespace VSCodePortableLauncher
 
             upgradeCompleted = false;
             upgradeStarted = false;
+            totalComponents = 0;
+            completedComponents = 0;
             versions = new Dictionary<string, string>();
             pendingUpgrades = upgrades;
+            logFileBuffer = new StringBuilder();
+            logFileLock = new object();
+            activityDisplayEntries = new Queue<string>();
+            overallStatusOverride = "Ready to upgrade";
 
             // Optimize network performance
             System.Net.ServicePointManager.DefaultConnectionLimit = 100;
@@ -92,6 +99,7 @@ namespace VSCodePortableLauncher
             
             // Initialize table with pending upgrades
             InitializePendingUpgradesTable();
+            UpdateCurrentTask("Ready to upgrade");
         }
 
         protected override CreateParams CreateParams
@@ -131,27 +139,55 @@ namespace VSCodePortableLauncher
                 .ToList();
 
             InitializeUpgradeTable(componentsToShow);
+            SetUpgradeSummary(componentsToShow);
+        }
+
+        private void SetUpgradeSummary(IList<string> components)
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action(() => SetUpgradeSummary(components)));
+                return;
+            }
+
+            var displayNames = components
+                .Select(GetDisplayComponentName)
+                .ToList();
+
+            summaryTitleLabel.Text = displayNames.Count > 0
+                ? "Pending updates (" + displayNames.Count + ")"
+                : "No pending updates";
+
+            if (displayNames.Count == 0)
+            {
+                summaryBodyLabel.Text = "Your portable environment is already up to date.";
+                return;
+            }
+
+            summaryBodyLabel.Text = "Updates will be applied to " + string.Join(", ", displayNames) + ".\r\nYour portable environment, settings, and extensions stay in place.";
         }
 
         private void UpgradeButton_Click(object sender, EventArgs e)
         {
-            if (upgradeStarted)
+            if (upgradeCompleted)
             {
-                // Upgrade completed, close form
                 Close();
             }
             else
             {
-                // Start upgrade
+                if (upgradeStarted)
+                    return;
+
                 upgradeStarted = true;
                 upgradeButton.Enabled = false;
-                upgradeButton.Text = "Exit";
+                upgradeButton.Text = "Upgrading...";
                 upgradeButton.BackColor = Color.FromArgb(200, 200, 200);
-                upgradeButton.ForeColor = Color.White;
+                upgradeButton.ForeColor = Color.FromArgb(100, 100, 100);
                 upgradeButton.FlatStyle = FlatStyle.Flat;
-                upgradeButton.FlatAppearance.BorderColor = Color.FromArgb(150, 150, 150);
+                upgradeButton.FlatAppearance.BorderSize = 0;
                 upgradeButton.Cursor = Cursors.WaitCursor;
                 cancelButton.Enabled = false;
+                UpdateCurrentTask("Now: Preparing updates");
 
                 Task.Run(async () =>
                 {
@@ -310,9 +346,6 @@ namespace VSCodePortableLauncher
                 UpdateVersionsInInfo(allResults);
                 DeleteUpgradeFlags();
 
-                // Save activity log to upgrade.log
-                SaveUpgradeLog();
-
                 LogActivity("Upgrade completed successfully!");
 
                 if (upgradeTimer != null)
@@ -328,20 +361,26 @@ namespace VSCodePortableLauncher
                 // Stop elapsed timer
                 StopElapsedTimer();
 
+                SaveUpgradeLog();
+
                 upgradeCompleted = true;
                 Invoke(new Action(() =>
                 {
                     upgradeButton.Enabled = true;
+                    upgradeButton.Text = "Exit";
                     upgradeButton.BackColor = Color.FromArgb(0, 120, 215);
                     upgradeButton.ForeColor = Color.White;
-                    upgradeButton.FlatStyle = FlatStyle.Standard;
-                    upgradeButton.Cursor = Cursors.Default;
+                    upgradeButton.FlatStyle = FlatStyle.Flat;
+                    upgradeButton.FlatAppearance.BorderSize = 0;
+                    upgradeButton.Cursor = Cursors.Hand;
+                    UpdateCurrentTask("Done: Updates applied successfully");
                 }));
             }
             catch (Exception ex)
             {
-                ShowError("Upgrade error: " + ex.Message);
                 LogActivity("Upgrade error: " + ex.Message);
+                SaveUpgradeLog();
+                ShowError("Upgrade error: " + ex.Message);
                 
                 // Stop elapsed timer
                 StopElapsedTimer();
@@ -350,10 +389,13 @@ namespace VSCodePortableLauncher
                 Invoke(new Action(() =>
                 {
                     upgradeButton.Enabled = true;
+                    upgradeButton.Text = "Exit";
                     upgradeButton.BackColor = Color.FromArgb(0, 120, 215);
                     upgradeButton.ForeColor = Color.White;
-                    upgradeButton.FlatStyle = FlatStyle.Standard;
-                    upgradeButton.Cursor = Cursors.Default;
+                    upgradeButton.FlatStyle = FlatStyle.Flat;
+                    upgradeButton.FlatAppearance.BorderSize = 0;
+                    upgradeButton.Cursor = Cursors.Hand;
+                    UpdateCurrentTask("Check: Upgrade failed");
                 }));
             }
         }
@@ -366,7 +408,6 @@ namespace VSCodePortableLauncher
                 return;
             }
 
-            // Enable only components that need upgrade
             var componentMap = new Dictionary<string, Tuple<Label, Label, ProgressBar>>
             {
                 { "PowerShell 7", Tuple.Create(pwsh7NameLabel, pwsh7StatusLabel, pwsh7ProgressBar) },
@@ -377,41 +418,66 @@ namespace VSCodePortableLauncher
                 { "VSCode", Tuple.Create(vscodeNameLabel, vscodeStatusLabel, vscodeProgressBar) }
             };
 
+            totalComponents = components.Count;
+            completedComponents = 0;
+
             foreach (var kvp in componentMap)
             {
                 bool shouldEnable = components.Contains(kvp.Key);
-                kvp.Value.Item1.Enabled = shouldEnable; // Name label
-                kvp.Value.Item2.Enabled = shouldEnable; // Status label
-                kvp.Value.Item3.Enabled = shouldEnable; // Progress bar
+                kvp.Value.Item1.Enabled = shouldEnable;
+                kvp.Value.Item2.Enabled = shouldEnable;
+                kvp.Value.Item3.Enabled = shouldEnable;
                 
                 if (shouldEnable)
                 {
-                    // Keep original component name for enabled rows
-                    kvp.Value.Item1.Text = kvp.Key;
+                    kvp.Value.Item1.Text = GetDisplayComponentName(kvp.Key);
                     kvp.Value.Item2.Text = "Waiting";
-                    kvp.Value.Item2.ForeColor = Color.Gray;
+                    kvp.Value.Item2.ForeColor = Color.FromArgb(160, 160, 160);
                     kvp.Value.Item3.Value = 0;
                 }
                 else
                 {
-                    // Replace component name with "-" for disabled rows
                     kvp.Value.Item1.Text = "-";
+                    kvp.Value.Item2.Text = "Not needed";
+                    kvp.Value.Item2.ForeColor = Color.FromArgb(180, 180, 180);
+                    kvp.Value.Item3.Value = 0;
                 }
             }
+
+            UpdateCompletedLabel();
+            RefreshOverallStatusLabel();
         }
 
-        private void LogActivity(string message)
+        private void LogActivity(string message, bool fileOnly = false)
         {
+            string timestamp = DateTime.Now.ToString("HH:mm:ss");
+            string elapsed = "";
+            if (upgradeTimer != null && upgradeTimer.IsRunning)
+            {
+                var e = upgradeTimer.Elapsed;
+                elapsed = string.Format(" +{0:D2}:{1:D2}", (int)e.TotalMinutes, e.Seconds);
+            }
+            string logEntry = "[" + timestamp + elapsed + "] " + message + "\r\n";
+
+            lock (logFileLock)
+            {
+                logFileBuffer.Append(logEntry);
+            }
+
+            if (fileOnly)
+                return;
+
             if (InvokeRequired)
             {
-                Invoke(new Action(() => LogActivity(message)));
+                Invoke(new Action(() => LogActivity(message, false)));
                 return;
             }
 
-            string timestamp = DateTime.Now.ToString("HH:mm:ss");
-            activityLog.AppendText(string.Format("[{0}] {1}\r\n", timestamp, message));
-            activityLog.SelectionStart = activityLog.Text.Length;
-            activityLog.ScrollToCaret();
+            string uiMessage = SimplifyActivityMessage(message);
+            if (string.IsNullOrEmpty(uiMessage))
+                return;
+
+            AppendActivityLogEntry("[" + timestamp + "] " + uiMessage);
         }
 
         private void UpdateComponentStatus(string componentName, string status, int progress)
@@ -422,7 +488,6 @@ namespace VSCodePortableLauncher
                 return;
             }
 
-            // Find and update the corresponding controls
             Label statusLabel = null;
             ProgressBar progressBar = null;
 
@@ -458,32 +523,52 @@ namespace VSCodePortableLauncher
 
             if (statusLabel != null && progressBar != null)
             {
-                statusLabel.Text = status;
+                string displayStatus = status;
+                string category = "Working";
+
+                if (status.Contains("Checking") || status.Contains("Requesting"))
+                { displayStatus = "Preparing"; category = "Working"; }
+                else if (status.Contains("Downloading") || status.Contains("download"))
+                { displayStatus = "Downloading"; category = "Downloading"; }
+                else if (status.Contains("Extracting") || status.Contains("extract") ||
+                         status.Contains("Installing") || status.Contains("Configuring") ||
+                         status.Contains("Creating") || status.Contains("Running") ||
+                         status.Contains("Verifying"))
+                { displayStatus = "Installing"; category = "Working"; }
+                else if (status.StartsWith("✓") || status.Contains("Completed"))
+                { displayStatus = "Completed"; category = "Completed"; }
+                else if (status.StartsWith("⚠") || status.Contains("Error") || status.Contains("failed"))
+                { displayStatus = "Failed"; category = "Failed"; }
+                else if (status.Contains("Waiting"))
+                { displayStatus = "Waiting"; category = "Waiting"; }
+
+                statusLabel.Text = displayStatus;
                 progressBar.Value = Math.Min(progress, 100);
 
-                switch (status)
-                {
-                    case "Waiting":
-                        statusLabel.ForeColor = Color.Gray;
-                        break;
-                    case "Downloading":
-                        statusLabel.ForeColor = Color.Blue;
-                        break;
-                    case "Installing":
-                        statusLabel.ForeColor = Color.DarkOrange;
-                        break;
-                    case "Completed":
-                        statusLabel.ForeColor = Color.Green;
-                        break;
-                    default:
-                        statusLabel.ForeColor = Color.Red;
-                        break;
-                }
+                if (category == "Waiting")
+                    statusLabel.ForeColor = Color.FromArgb(160, 160, 160);
+                else if (category == "Downloading")
+                    statusLabel.ForeColor = Color.FromArgb(0, 120, 212);
+                else if (category == "Working")
+                    statusLabel.ForeColor = Color.FromArgb(0, 120, 212);
+                else if (category == "Completed")
+                    statusLabel.ForeColor = Color.FromArgb(16, 124, 16);
+                else
+                    statusLabel.ForeColor = Color.FromArgb(196, 43, 28);
+
+                overallStatusOverride = null;
+                UpdateOverallProgress();
             }
         }
 
         private void StartElapsedTimer()
         {
+            if (InvokeRequired)
+            {
+                Invoke(new Action(StartElapsedTimer));
+                return;
+            }
+
             if (elapsedTimer != null)
             {
                 elapsedTimer.Stop();
@@ -494,10 +579,17 @@ namespace VSCodePortableLauncher
             elapsedTimer.Interval = 1000; // Update every 1 second
             elapsedTimer.Tick += (s, e) => UpdateElapsedTimeDisplay();
             elapsedTimer.Start();
+            UpdateElapsedTimeDisplay();
         }
 
         private void StopElapsedTimer()
         {
+            if (InvokeRequired)
+            {
+                Invoke(new Action(StopElapsedTimer));
+                return;
+            }
+
             if (elapsedTimer != null)
             {
                 elapsedTimer.Stop();
@@ -517,11 +609,233 @@ namespace VSCodePortableLauncher
             if (upgradeTimer != null && upgradeTimer.IsRunning && elapsedTimeLabel != null)
             {
                 var elapsed = upgradeTimer.Elapsed;
-                string elapsedStr = string.Format("{0:D2}:{1:D2}:{2:D2}",
-                    elapsed.Hours, elapsed.Minutes, elapsed.Seconds);
-                elapsedTimeLabel.Text = "Elapsed: " + elapsedStr;
-                elapsedTimeLabel.Visible = true;
+                elapsedTimeLabel.Text = "Elapsed (mm:ss): " + FormatElapsedForUi(elapsed);
             }
+        }
+
+        private void UpdateOverallProgress()
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action(UpdateOverallProgress));
+                return;
+            }
+
+            var rows = GetComponentRows().Where(row => row.Item5).ToList();
+            if (rows.Count == 0)
+            {
+                overallProgress.Value = 0;
+                UpdateCompletedLabel();
+                RefreshOverallStatusLabel();
+                return;
+            }
+
+            int totalProgress = rows.Sum(row => row.Item4.Value);
+            overallProgress.Value = Math.Min(totalProgress / rows.Count, 100);
+            completedComponents = rows.Count(row => row.Item4.Value >= 100);
+
+            UpdateCompletedLabel();
+            RefreshOverallStatusLabel();
+        }
+
+        private void UpdateCompletedLabel()
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action(UpdateCompletedLabel));
+                return;
+            }
+
+            if (totalComponents > 0)
+                completedLabel.Text = string.Format("Overall Progress: {0}% complete ({1}/{2} ready)", overallProgress.Value, completedComponents, totalComponents);
+            else
+                completedLabel.Text = string.Format("Overall Progress: {0}% complete", overallProgress.Value);
+        }
+
+        private void UpdateCurrentTask(string message)
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action(() => UpdateCurrentTask(message)));
+                return;
+            }
+
+            overallStatusOverride = SimplifyOverallStatusMessage(message);
+            currentTaskLabel.Text = overallStatusOverride;
+        }
+
+        private void RefreshOverallStatusLabel()
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action(RefreshOverallStatusLabel));
+                return;
+            }
+
+            if (!string.IsNullOrEmpty(overallStatusOverride))
+            {
+                currentTaskLabel.Text = overallStatusOverride;
+                return;
+            }
+
+            currentTaskLabel.Text = BuildOverallStatusMessage();
+        }
+
+        private string BuildOverallStatusMessage()
+        {
+            var rows = GetComponentRows()
+                .Where(row => row.Item5)
+                .OrderByDescending(row => GetComponentPriority(row.Item1))
+                .ToList();
+
+            var failed = rows.FirstOrDefault(row => row.Item4.Value < 100 && string.Equals(row.Item3.Text, "Failed", StringComparison.OrdinalIgnoreCase));
+            if (failed != null)
+                return "Check: one or more updates need attention";
+
+            if (completedComponents == totalComponents && totalComponents > 0)
+                return "Done: Portable environment updated";
+
+            if (overallProgress.Value >= 95)
+                return "Now: Finalizing update";
+
+            if (overallProgress.Value > 0)
+                return "Now: Applying updates";
+
+            if (upgradeStarted && !upgradeCompleted)
+                return "Now: Preparing updates";
+
+            return "Ready to upgrade";
+        }
+
+        private IEnumerable<Tuple<string, Label, Label, ProgressBar, bool>> GetComponentRows()
+        {
+            yield return Tuple.Create("PowerShell 7", pwsh7NameLabel, pwsh7StatusLabel, pwsh7ProgressBar, pwsh7NameLabel.Enabled);
+            yield return Tuple.Create("Oh My Posh", ohmyposhNameLabel, ohmyposhStatusLabel, ohmyposhProgressBar, ohmyposhNameLabel.Enabled);
+            yield return Tuple.Create("Terminal-Icons", termIconsNameLabel, termIconsStatusLabel, termIconsProgressBar, termIconsNameLabel.Enabled);
+            yield return Tuple.Create("PSFzf", psfzfNameLabel, psfzfStatusLabel, psfzfProgressBar, psfzfNameLabel.Enabled);
+            yield return Tuple.Create("modern-unix-win", modernUnixNameLabel, modernUnixStatusLabel, modernUnixProgressBar, modernUnixNameLabel.Enabled);
+            yield return Tuple.Create("VSCode", vscodeNameLabel, vscodeStatusLabel, vscodeProgressBar, vscodeNameLabel.Enabled);
+        }
+
+        private int GetComponentPriority(string componentName)
+        {
+            switch (componentName)
+            {
+                case "VSCode":
+                    return 6;
+                case "PowerShell 7":
+                    return 5;
+                case "Oh My Posh":
+                    return 4;
+                case "Terminal-Icons":
+                    return 3;
+                case "PSFzf":
+                    return 2;
+                case "modern-unix-win":
+                    return 1;
+                default:
+                    return 0;
+            }
+        }
+
+        private string GetDisplayComponentName(string componentName)
+        {
+            return string.Equals(componentName, "VSCode", StringComparison.OrdinalIgnoreCase)
+                ? "VS Code"
+                : componentName;
+        }
+
+        private string FormatElapsedForUi(TimeSpan elapsed)
+        {
+            return string.Format("{0:D2}:{1:D2}", (int)elapsed.TotalMinutes, elapsed.Seconds);
+        }
+
+        private string SimplifyOverallStatusMessage(string message)
+        {
+            string normalized = (message ?? "").Trim();
+            if (string.IsNullOrEmpty(normalized))
+                return "Ready to upgrade";
+
+            if (normalized.StartsWith("Now:") || normalized.StartsWith("Done:") || normalized.StartsWith("Check:") || normalized.StartsWith("Queued:"))
+                return normalized;
+
+            if (normalized.IndexOf("Upgrade completed successfully", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "Done: Updates applied successfully";
+            if (normalized.IndexOf("Upgrade error", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "Check: Upgrade failed";
+
+            return normalized.TrimStart('✓', '⚠', ' ');
+        }
+
+        private string SimplifyActivityMessage(string message)
+        {
+            string normalized = (message ?? "").Trim();
+            if (string.IsNullOrEmpty(normalized))
+                return null;
+
+            normalized = normalized.Replace("VSCode", "VS Code");
+
+            if (normalized.IndexOf("Parallel extraction using", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                normalized.IndexOf("Created directory:", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                normalized.IndexOf("Received version info -", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                normalized.IndexOf("Upgrade log saved to:", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                normalized.IndexOf("Skipping recursive unblock", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                normalized.IndexOf("pwsh.exe extracted successfully", StringComparison.OrdinalIgnoreCase) >= 0)
+                return null;
+
+            if (Regex.IsMatch(normalized, @"Downloading\.\.\.\s+\d+%", RegexOptions.IgnoreCase))
+                return null;
+
+            if (normalized.StartsWith("=== Upgrade started at ", StringComparison.OrdinalIgnoreCase) ||
+                normalized.StartsWith("=== Upgrade completed at ", StringComparison.OrdinalIgnoreCase))
+                return normalized.Trim('=').Trim();
+
+            if (normalized.StartsWith("*** Total upgrade time:", StringComparison.OrdinalIgnoreCase))
+                return "Total time: " + FormatDurationFromLog(normalized);
+
+            if (normalized.Equals("Checking for running Code.exe processes...", StringComparison.OrdinalIgnoreCase))
+                return "Checking for running VS Code windows";
+            if (normalized.IndexOf("Found ", StringComparison.OrdinalIgnoreCase) == 0 && normalized.IndexOf("Code.exe process", StringComparison.OrdinalIgnoreCase) > 0)
+                return "Closing running VS Code windows";
+            if (normalized.Equals("Code.exe processes terminated.", StringComparison.OrdinalIgnoreCase))
+                return "VS Code windows closed";
+            if (normalized.Equals("PowerShell 7: Upgrading first (required for modules)...", StringComparison.OrdinalIgnoreCase))
+                return "PowerShell 7: Updating first for module compatibility";
+
+            var upgradedVersionMatch = Regex.Match(normalized, @"^(PowerShell 7|Oh My Posh|Terminal-Icons|PSFzf|modern-unix-win|VS Code):\s+Upgrade completed\s+-\s+version\s+(.+)$", RegexOptions.IgnoreCase);
+            if (upgradedVersionMatch.Success)
+                return upgradedVersionMatch.Groups[1].Value + ": Updated to " + upgradedVersionMatch.Groups[2].Value.Trim();
+
+            return normalized;
+        }
+
+        private string FormatDurationFromLog(string message)
+        {
+            var match = Regex.Match(message, @"(\d{2}):(\d{2}):(\d{2})");
+            if (!match.Success)
+                return message;
+
+            int hours = int.Parse(match.Groups[1].Value);
+            int minutes = int.Parse(match.Groups[2].Value);
+            int seconds = int.Parse(match.Groups[3].Value);
+            return string.Format("{0:D2}:{1:D2}", (hours * 60) + minutes, seconds);
+        }
+
+        private void AppendActivityLogEntry(string entry)
+        {
+            if (string.IsNullOrEmpty(entry))
+                return;
+
+            if (activityDisplayEntries.Count > 0 && activityDisplayEntries.Last() == entry)
+                return;
+
+            activityDisplayEntries.Enqueue(entry);
+            while (activityDisplayEntries.Count > MAX_ACTIVITY_LOG_LINES)
+                activityDisplayEntries.Dequeue();
+
+            activityLog.Lines = activityDisplayEntries.ToArray();
+            activityLog.SelectionStart = activityLog.Text.Length;
+            activityLog.ScrollToCaret();
         }
 
         private async Task<KeyValuePair<string, string>> UpgradePowerShell7Async()
@@ -753,8 +1067,13 @@ namespace VSCodePortableLauncher
                 logHeader += "Upgrade Session: " + upgradeStartTime.ToString("yyyy-MM-dd HH:mm:ss") + "\r\n";
                 logHeader += new string('=', 80) + "\r\n";
 
-                // Append to existing log file or create new one
-                File.AppendAllText(logPath, logHeader + activityLog.Text + "\r\n", Encoding.UTF8);
+                string logContent;
+                lock (logFileLock)
+                {
+                    logContent = logFileBuffer.ToString();
+                }
+
+                File.AppendAllText(logPath, logHeader + logContent + "\r\n", Encoding.UTF8);
                 LogActivity("Upgrade log saved to: " + logPath);
             }
             catch (Exception ex)

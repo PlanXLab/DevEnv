@@ -68,6 +68,7 @@ namespace VSCodePortableInstaller
             // headerPanel
             //
             this.headerPanel.BackColor = System.Drawing.Color.FromArgb(0, 88, 160);
+            this.headerPanel.Controls.Add(this.label1);
             this.headerPanel.Controls.Add(this.headerSubLabel);
             this.headerPanel.Controls.Add(this.headerTitleLabel);
             this.headerPanel.Location = new System.Drawing.Point(0, 0);
@@ -96,7 +97,6 @@ namespace VSCodePortableInstaller
             // settingsPanel
             //
             this.settingsPanel.BackColor = System.Drawing.Color.FromArgb(249, 249, 249);
-            this.settingsPanel.Controls.Add(this.label1);
             this.settingsPanel.Controls.Add(this.cancelButton);
             this.settingsPanel.Controls.Add(this.installButton);
             this.settingsPanel.Controls.Add(this.pythonHint);
@@ -177,12 +177,12 @@ namespace VSCodePortableInstaller
             // label1
             //
             this.label1.Font = new System.Drawing.Font("Segoe UI", 8F);
-            this.label1.ForeColor = System.Drawing.Color.FromArgb(130, 170, 210);
-            this.label1.Location = new System.Drawing.Point(24, 86);
+            this.label1.ForeColor = System.Drawing.Color.FromArgb(214, 232, 247);
+            this.label1.Location = new System.Drawing.Point(414, 22);
             this.label1.Name = "label1";
-            this.label1.Size = new System.Drawing.Size(140, 20);
-            this.label1.Text = "PlanX Lab \u00b7 Atticle";
-            this.label1.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
+            this.label1.Size = new System.Drawing.Size(286, 20);
+            this.label1.Text = "Created by Atticle at PlanX Lab | devcamp@gmail.com";
+            this.label1.TextAlign = System.Drawing.ContentAlignment.MiddleRight;
             //
             // installButton
             //
@@ -411,28 +411,29 @@ namespace VSCodePortableInstaller
             this.completedLabel.ForeColor = System.Drawing.Color.FromArgb(120, 120, 120);
             this.completedLabel.Location = new System.Drawing.Point(20, 180);
             this.completedLabel.Name = "completedLabel";
-            this.completedLabel.Size = new System.Drawing.Size(220, 18);
+            this.completedLabel.Size = new System.Drawing.Size(250, 18);
             this.completedLabel.TabIndex = 2;
-            this.completedLabel.Text = "Completed: 0/0 components";
+            this.completedLabel.Text = "Overall Progress: 0% complete";
             //
             // elapsedTimeLabel
             //
             this.elapsedTimeLabel.Font = new System.Drawing.Font("Segoe UI", 8.5F);
             this.elapsedTimeLabel.ForeColor = System.Drawing.Color.FromArgb(120, 120, 120);
-            this.elapsedTimeLabel.Location = new System.Drawing.Point(240, 180);
+            this.elapsedTimeLabel.Location = new System.Drawing.Point(272, 180);
             this.elapsedTimeLabel.Name = "elapsedTimeLabel";
-            this.elapsedTimeLabel.Size = new System.Drawing.Size(140, 18);
+            this.elapsedTimeLabel.Size = new System.Drawing.Size(150, 18);
             this.elapsedTimeLabel.TabIndex = 3;
-            this.elapsedTimeLabel.Text = "Elapsed: 00:00:00";
+            this.elapsedTimeLabel.Text = "Elapsed (mm:ss): 00:00";
             //
             // currentTaskLabel
             //
             this.currentTaskLabel.Font = new System.Drawing.Font("Segoe UI", 8.5F);
             this.currentTaskLabel.ForeColor = System.Drawing.Color.FromArgb(0, 120, 212);
-            this.currentTaskLabel.Location = new System.Drawing.Point(380, 180);
+            this.currentTaskLabel.Location = new System.Drawing.Point(430, 180);
             this.currentTaskLabel.Name = "currentTaskLabel";
-            this.currentTaskLabel.Size = new System.Drawing.Size(320, 18);
+            this.currentTaskLabel.Size = new System.Drawing.Size(270, 18);
             this.currentTaskLabel.TabIndex = 4;
+            this.currentTaskLabel.Text = "Ready to install";
             this.currentTaskLabel.TextAlign = System.Drawing.ContentAlignment.MiddleRight;
             //
             // logHeaderLabel
@@ -444,14 +445,14 @@ namespace VSCodePortableInstaller
             this.logHeaderLabel.Name = "logHeaderLabel";
             this.logHeaderLabel.Size = new System.Drawing.Size(64, 13);
             this.logHeaderLabel.TabIndex = 5;
-            this.logHeaderLabel.Text = "Activity Log";
+            this.logHeaderLabel.Text = "Key Events";
             //
             // activityLog
             //
-            this.activityLog.BackColor = System.Drawing.Color.FromArgb(30, 30, 30);
-            this.activityLog.BorderStyle = System.Windows.Forms.BorderStyle.None;
-            this.activityLog.Font = new System.Drawing.Font("Consolas", 8.25F);
-            this.activityLog.ForeColor = System.Drawing.Color.FromArgb(204, 204, 204);
+            this.activityLog.BackColor = System.Drawing.Color.FromArgb(248, 248, 248);
+            this.activityLog.BorderStyle = System.Windows.Forms.BorderStyle.FixedSingle;
+            this.activityLog.Font = new System.Drawing.Font("Segoe UI", 8.5F);
+            this.activityLog.ForeColor = System.Drawing.Color.FromArgb(64, 64, 64);
             this.activityLog.Location = new System.Drawing.Point(20, 224);
             this.activityLog.Multiline = true;
             this.activityLog.Name = "activityLog";

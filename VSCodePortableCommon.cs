@@ -415,6 +415,7 @@ namespace VSCodePortableCommon
 
                     // Extract directly to target directory (no intermediate copy)
                     await ExtractZipAsync(zipPath, pwshDir, componentName, 45, 58);
+                    logActivity("PowerShell 7: Core archive extracted");
 
                     updateStatus(componentName, "Verifying...", 58);
 
@@ -1121,6 +1122,7 @@ namespace VSCodePortableCommon
                 {
                     client.Timeout = TimeSpan.FromMinutes(20);
                     client.DefaultRequestHeaders.Add("User-Agent", "VSCode-Portable-Installer");
+                    client.DefaultRequestHeaders.ConnectionClose = false;
 
                     // Get latest version via redirect
                     var request = new HttpRequestMessage(HttpMethod.Head, "https://update.code.visualstudio.com/latest/win32-x64-archive/stable");
@@ -1185,25 +1187,10 @@ namespace VSCodePortableCommon
 
                     // Extract directly to PVS directory
                     await ExtractZipAsync(zipPath, baseDir, componentName, 70, 95);
+                    logActivity("VSCode: Core archive extracted");
 
                     updateStatus(componentName, "Finalizing...", 99);
-
-                    // Unblock files
-                    try
-                    {
-                        var psi = new ProcessStartInfo
-                        {
-                            FileName = "powershell",
-                            Arguments = "-NoProfile -Command \"Get-ChildItem -Path '" + baseDir + "' -Recurse | Unblock-File\"",
-                            UseShellExecute = false,
-                            CreateNoWindow = true
-                        };
-                        using (var process = Process.Start(psi))
-                        {
-                            process.WaitForExit(30000);
-                        }
-                    }
-                    catch { }
+                    logActivity("VSCode: Skipping recursive unblock (streamed extraction produces local files)");
 
                     // Cleanup
                     if (Directory.Exists(tempDir))
