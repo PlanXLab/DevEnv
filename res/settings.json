@@ -59,7 +59,7 @@
 
   "python.terminal.activateEnvironment": false,
   "python.venvFolders": [],
-  "python.defaultInterpreterPath": "${execPath}\\..\\data\\lib\\python\\python.exe",
+  "python.defaultInterpreterPath": "python",
   "python.createEnvironment.trigger": "off",
   "python.analysis.diagnosticSeverityOverrides": {
       "reportMissingModuleSource": "none"

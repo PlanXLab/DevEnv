@@ -13,6 +13,17 @@ namespace VSCodePortableLauncher
 {
     class Program
     {
+        static readonly string[] PlatformSensitiveVSCodeExtensions = new[]
+        {
+            "ms-python.python",
+            "ms-python.vscode-python-envs"
+        };
+
+        static readonly string[] OptionalAutoInstalledVSCodeExtensions = new[]
+        {
+            "ms-python.debugpy"
+        };
+
         [STAThread]
         static int Main(string[] args)
         {
@@ -164,8 +175,22 @@ namespace VSCodePortableLauncher
             if (string.IsNullOrEmpty(basePath))
                 basePath = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
 
+            var pyenvRoots = new List<string>();
+            CollectIfPresent(pyenvRoots, psi.EnvironmentVariables["PYENV"]);
+            CollectIfPresent(pyenvRoots, psi.EnvironmentVariables["PYENV_ROOT"]);
+            CollectIfPresent(pyenvRoots, psi.EnvironmentVariables["PYENV_HOME"]);
+
+            RemoveEnvironmentVariable(psi, "PYENV");
+            RemoveEnvironmentVariable(psi, "PYENV_ROOT");
+            RemoveEnvironmentVariable(psi, "PYENV_HOME");
+            RemoveEnvironmentVariable(psi, "PYENV_DIR");
+            RemoveEnvironmentVariable(psi, "PYENV_VERSION");
+            RemoveEnvironmentVariable(psi, "PYENV_SHELL");
+            RemoveEnvironmentVariable(psi, "PYENV_HOOK_PATH");
+
             var pathEntries = basePath
                 .Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries)
+                .Where(existing => !IsPyenvPath(existing, pyenvRoots))
                 .ToList();
 
             for (int i = preferredPaths.Length - 1; i >= 0; i--)
@@ -181,6 +206,38 @@ namespace VSCodePortableLauncher
             }
 
             psi.EnvironmentVariables["PATH"] = string.Join(";", pathEntries.ToArray());
+        }
+
+        static void CollectIfPresent(ICollection<string> values, string candidate)
+        {
+            if (!string.IsNullOrEmpty(candidate))
+                values.Add(candidate);
+        }
+
+        static void RemoveEnvironmentVariable(ProcessStartInfo psi, string name)
+        {
+            if (psi.EnvironmentVariables.ContainsKey(name))
+                psi.EnvironmentVariables.Remove(name);
+        }
+
+        static bool IsPyenvPath(string pathEntry, IEnumerable<string> pyenvRoots)
+        {
+            if (string.IsNullOrEmpty(pathEntry))
+                return false;
+
+            string normalizedEntry = pathEntry.Trim().TrimEnd('\\');
+            foreach (var root in pyenvRoots)
+            {
+                if (string.IsNullOrEmpty(root))
+                    continue;
+
+                string normalizedRoot = root.Trim().TrimEnd('\\');
+                if (normalizedEntry.StartsWith(normalizedRoot, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+
+            return normalizedEntry.IndexOf("\\.pyenv\\", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   normalizedEntry.IndexOf("\\pyenv-win\\", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         static bool CheckRuntimeMigration(string pvsDir, string pvsInfo)
@@ -534,6 +591,22 @@ namespace VSCodePortableLauncher
                     .ToList();
 
                 var requiredExtensions = UpgradeForm.VSCODE_EXTENSIONS.ToList();
+
+                foreach (var required in PlatformSensitiveVSCodeExtensions)
+                {
+                    var invalidInstalls = installedDirs
+                        .Where(installed => installed.StartsWith(required + "-", StringComparison.OrdinalIgnoreCase))
+                        .Where(installed => !ValidateInstalledVSCodeExtension(Path.Combine(extensionsDir, installed), required))
+                        .ToList();
+
+                    foreach (var invalidInstall in invalidInstalls)
+                    {
+                        string invalidPath = Path.Combine(extensionsDir, invalidInstall);
+                        Console.WriteLine("  Removing invalid extension payload: " + invalidInstall);
+                        Directory.Delete(invalidPath, true);
+                        installedDirs.Remove(invalidInstall);
+                    }
+                }
                 
                 // Find extensions to remove (not in required list)
                 var toRemove = installedDirs.Where(installed =>
@@ -561,29 +634,39 @@ namespace VSCodePortableLauncher
                 if (toInstall.Any())
                 {
                     string codeExe = Path.Combine(pvsDir, "Code.exe");
-                    string cliJs = Path.Combine(pvsDir, "resources", "app", "out", "cli.js");
+                    string cliJs = ResolveVSCodeCliJsPath(pvsDir);
                     string relativeExtensionsDir = Path.Combine("data", "extensions");
                     string relativeUserDataDir = Path.Combine("data", "user-data");
 
-                    foreach (var ext in toInstall)
+                    if (!File.Exists(codeExe) || string.IsNullOrEmpty(cliJs) || !File.Exists(cliJs))
                     {
-                        Console.WriteLine("  Installing: " + ext);
-                        var psi = new ProcessStartInfo
+                        Console.WriteLine("  VS Code CLI not found, skipping extension install...");
+                    }
+                    else
+                    {
+                        foreach (var ext in toInstall)
                         {
-                            FileName = codeExe,
-                            Arguments = "\"" + cliJs + "\" --extensions-dir \"" + relativeExtensionsDir + "\" --user-data-dir \"" + relativeUserDataDir + "\" --install-extension " + ext + " --force",
-                            UseShellExecute = false,
-                            CreateNoWindow = true,
-                            WorkingDirectory = pvsDir
-                        };
-                        psi.EnvironmentVariables["ELECTRON_RUN_AS_NODE"] = "1";
-                        
-                        using (var process = Process.Start(psi))
-                        {
-                            process.WaitForExit();
+                            Console.WriteLine("  Installing: " + ext);
+                            var psi = new ProcessStartInfo
+                            {
+                                FileName = codeExe,
+                                Arguments = "\"" + cliJs + "\" --extensions-dir \"" + relativeExtensionsDir + "\" --user-data-dir \"" + relativeUserDataDir + "\" --install-extension " + ext + " --force",
+                                UseShellExecute = false,
+                                CreateNoWindow = true,
+                                WorkingDirectory = pvsDir
+                            };
+                            psi.EnvironmentVariables["ELECTRON_RUN_AS_NODE"] = "1";
+                            psi.EnvironmentVariables["VSCODE_DEV"] = "";
+
+                            using (var process = Process.Start(psi))
+                            {
+                                process.WaitForExit();
+                            }
                         }
                     }
                 }
+
+                RemoveExtensionsByPrefix(extensionsDir, OptionalAutoInstalledVSCodeExtensions, "  Removing optional extension: ");
 
                 // Delete extensions.json
                 string extensionsJson = Path.Combine(extensionsDir, "extensions.json");
@@ -596,6 +679,86 @@ namespace VSCodePortableLauncher
             catch (Exception ex)
             {
                 Console.WriteLine("  Extension sync error: " + ex.Message);
+            }
+        }
+
+        static string ResolveVSCodeCliJsPath(string pvsDir)
+        {
+            string cliJs = Path.Combine(pvsDir, "resources", "app", "out", "cli.js");
+            if (File.Exists(cliJs))
+                return cliJs;
+
+            var candidates = Directory.GetFiles(pvsDir, "cli.js", SearchOption.AllDirectories)
+                .Where(path => path.EndsWith(Path.Combine("resources", "app", "out", "cli.js"), StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+
+            return candidates.FirstOrDefault() ?? string.Empty;
+        }
+
+        static bool ValidateInstalledVSCodeExtension(string extensionPath, string extensionId)
+        {
+            if (string.IsNullOrEmpty(extensionPath) || string.IsNullOrEmpty(extensionId) || !Directory.Exists(extensionPath))
+                return false;
+
+            if (!PlatformSensitiveVSCodeExtensions.Any(ext => string.Equals(ext, extensionId, StringComparison.OrdinalIgnoreCase)))
+                return true;
+
+            string toolsDir = Path.Combine(extensionPath, "python-env-tools", "bin");
+            string windowsToolPath = Path.Combine(toolsDir, "pet.exe");
+            if (File.Exists(windowsToolPath))
+                return true;
+
+            string extractedToolPath = Path.Combine(toolsDir, "pet");
+            if (!File.Exists(extractedToolPath) || !HasPortableExecutableHeader(extractedToolPath))
+                return false;
+
+            try
+            {
+                File.Copy(extractedToolPath, windowsToolPath, true);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        static bool HasPortableExecutableHeader(string filePath)
+        {
+            try
+            {
+                using (var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read))
+                {
+                    if (stream.Length < 2)
+                        return false;
+
+                    int first = stream.ReadByte();
+                    int second = stream.ReadByte();
+                    return first == 'M' && second == 'Z';
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        static void RemoveExtensionsByPrefix(string extensionsDir, IEnumerable<string> extensionIds, string messagePrefix)
+        {
+            if (string.IsNullOrEmpty(extensionsDir) || !Directory.Exists(extensionsDir) || extensionIds == null)
+                return;
+
+            foreach (var extensionId in extensionIds)
+            {
+                if (string.IsNullOrEmpty(extensionId))
+                    continue;
+
+                foreach (var installedDir in Directory.GetDirectories(extensionsDir)
+                    .Where(dir => Path.GetFileName(dir).StartsWith(extensionId + "-", StringComparison.OrdinalIgnoreCase)))
+                {
+                    Console.WriteLine(messagePrefix + Path.GetFileName(installedDir));
+                    Directory.Delete(installedDir, true);
+                }
             }
         }
 

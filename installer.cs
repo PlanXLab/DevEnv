@@ -28,6 +28,15 @@ namespace VSCodePortableInstaller
         private const int VSCODE_DOWNLOAD_RETRY_COUNT = 2;
         private const int VSCODE_EXTENSION_DOWNLOAD_CONCURRENCY = 4;
         private const int MAX_ACTIVITY_LOG_LINES = 20;
+        private static readonly string[] VSCODE_PLATFORM_SENSITIVE_EXTENSIONS = new[]
+        {
+            "ms-python.python",
+            "ms-python.vscode-python-envs"
+        };
+        private static readonly string[] VSCODE_OPTIONAL_AUTO_INSTALLED_EXTENSIONS = new[]
+        {
+            "ms-python.debugpy"
+        };
         
         // URLs
         private const string PYTHON_DOWNLOADS_URL = "https://www.python.org/downloads/windows/";
@@ -2804,6 +2813,7 @@ namespace VSCodePortableInstaller
                     "zhuangtongfa.material-theme",
                     "ms-python.python",
                     "ms-python.vscode-pylance",
+                    "ms-python.vscode-python-envs",
                     "ms-vscode-remote.remote-ssh",
                     "KevinRose.vsc-python-indent",
                     "usernamehw.errorlens",
@@ -2868,7 +2878,7 @@ namespace VSCodePortableInstaller
                                 LogActivity("VSCode: Final retry -- " + ext + "...");
 
                                 string retryInput;
-                                if (!downloadedPackages.TryGetValue(ext, out retryInput))
+                                if (ShouldRetryVSCodeExtensionById(ext) || !downloadedPackages.TryGetValue(ext, out retryInput))
                                     retryInput = ext;
 
                                 string retryArguments = BuildVSCodeExtensionInstallArguments(cliJs, extensionsDir, userDataDir, new[] { retryInput });
@@ -2912,6 +2922,8 @@ namespace VSCodePortableInstaller
                     }
                 }
 
+                RemoveVSCodeExtensionsByPrefix(extensionsDir, VSCODE_OPTIONAL_AUTO_INSTALLED_EXTENSIONS);
+
                 LogActivity("VSCode: All extensions processed (" + installed + "/" + total + ")");
 
                 // Remove extensions.json so VSCode regenerates it cleanly on first launch
@@ -2951,6 +2963,7 @@ namespace VSCodePortableInstaller
             try
             {
                 Tuple<string, string, string> packageInfo;
+                string destinationDir = null;
                 using (var archive = ZipFile.OpenRead(vsixPath))
                 {
                     packageInfo = ReadVSCodeExtensionPackageInfo(archive, extensionId);
@@ -2960,7 +2973,7 @@ namespace VSCodePortableInstaller
                         return false;
                     }
 
-                    string destinationDir = Path.Combine(extensionsDir, packageInfo.Item1 + "." + packageInfo.Item2 + "-" + packageInfo.Item3);
+                    destinationDir = Path.Combine(extensionsDir, packageInfo.Item1 + "." + packageInfo.Item2 + "-" + packageInfo.Item3);
                     if (Directory.Exists(destinationDir))
                     {
                         try { Directory.Delete(destinationDir, true); } catch { }
@@ -2998,6 +3011,13 @@ namespace VSCodePortableInstaller
                     }
                 }
 
+                if (!ValidateExtractedVSCodeExtension(destinationDir, extensionId))
+                {
+                    try { Directory.Delete(destinationDir, true); } catch { }
+                    LogActivity("VSCode: Direct extraction validation failed -- " + extensionId);
+                    return false;
+                }
+
                 bool installed = IsVSCodeExtensionInstalled(extensionsDir, extensionId);
                 if (!installed)
                     LogActivity("VSCode: Direct extraction verification failed -- " + extensionId);
@@ -3007,6 +3027,96 @@ namespace VSCodePortableInstaller
             {
                 LogActivity("VSCode: Direct extraction failed -- " + extensionId + " -- " + ex.Message);
                 return false;
+            }
+        }
+
+        private bool ShouldRetryVSCodeExtensionById(string extensionId)
+        {
+            return VSCODE_PLATFORM_SENSITIVE_EXTENSIONS.Any(ext =>
+                string.Equals(ext, extensionId, StringComparison.OrdinalIgnoreCase));
+        }
+
+        private bool ValidateExtractedVSCodeExtension(string destinationDir, string extensionId)
+        {
+            if (string.IsNullOrEmpty(destinationDir) || string.IsNullOrEmpty(extensionId))
+                return false;
+
+            if (!ShouldRetryVSCodeExtensionById(extensionId))
+                return true;
+
+            string toolsDir = Path.Combine(destinationDir, "python-env-tools", "bin");
+            string windowsToolPath = Path.Combine(toolsDir, "pet.exe");
+            if (File.Exists(windowsToolPath))
+                return true;
+
+            string extractedToolPath = Path.Combine(toolsDir, "pet");
+            if (!File.Exists(extractedToolPath))
+            {
+                LogActivity("VSCode: Python environment tools missing after extraction -- " + extensionId);
+                return false;
+            }
+
+            if (!HasPortableExecutableHeader(extractedToolPath))
+            {
+                LogActivity("VSCode: Python environment tools payload is not Windows-compatible -- " + extensionId);
+                return false;
+            }
+
+            try
+            {
+                File.Copy(extractedToolPath, windowsToolPath, true);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                LogActivity("VSCode: Failed to materialize pet.exe -- " + extensionId + " -- " + ex.Message);
+                return false;
+            }
+        }
+
+        private bool HasPortableExecutableHeader(string filePath)
+        {
+            try
+            {
+                using (var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read))
+                {
+                    if (stream.Length < 2)
+                        return false;
+
+                    int first = stream.ReadByte();
+                    int second = stream.ReadByte();
+                    return first == 'M' && second == 'Z';
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private void RemoveVSCodeExtensionsByPrefix(string extensionsDir, IEnumerable<string> extensionIds)
+        {
+            if (string.IsNullOrEmpty(extensionsDir) || !Directory.Exists(extensionsDir) || extensionIds == null)
+                return;
+
+            foreach (var extensionId in extensionIds)
+            {
+                if (string.IsNullOrEmpty(extensionId))
+                    continue;
+
+                foreach (var installedDir in Directory.GetDirectories(extensionsDir)
+                    .Where(dir => Path.GetFileName(dir).StartsWith(extensionId + "-", StringComparison.OrdinalIgnoreCase)))
+                {
+                    try
+                    {
+                        Directory.Delete(installedDir, true);
+                        LogActivity("VSCode: Removed optional auto-installed extension -- " + Path.GetFileName(installedDir));
+                    }
+                    catch (Exception ex)
+                    {
+                        LogActivity("VSCode: Failed to remove optional extension -- " + Path.GetFileName(installedDir) + " -- " + ex.Message);
+                    }
+                }
             }
         }
 
