@@ -52,7 +52,7 @@
   "terminal.integrated.profiles.windows": {
     "PowerShell 7 (portable)": {
       "path": "${execPath}\\..\\data\\lib\\pwsh\\pwsh.exe",
-      "args": [],
+      "args": ["-NoLogo"],
       "icon": "terminal-powershell"
     }
   },
