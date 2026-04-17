@@ -59,7 +59,7 @@
 
   "python.terminal.activateEnvironment": false,
   "python.venvFolders": [],
-  "python.defaultInterpreterPath": "python",
+  "python.useEnvironmentsExtension": true,
   "python.createEnvironment.trigger": "off",
   "python.analysis.diagnosticSeverityOverrides": {
       "reportMissingModuleSource": "none"

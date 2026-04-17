@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -61,6 +62,8 @@ namespace VSCodePortableLauncher
         {
             string pvsDir = AppDomain.CurrentDomain.BaseDirectory;
             string pvsInfo = Path.Combine(pvsDir, "pvs.info");
+
+            NormalizeVSCodeSettingsFiles(pvsDir);
 
             // Step 1: Check if launched from shortcut
             bool runtimeContextChanged = false;
@@ -536,6 +539,8 @@ namespace VSCodePortableLauncher
             
             try
             {
+                NormalizeVSCodeSettingsFiles(pvsDir);
+
                 Console.WriteLine("Initializing PVS environment...");
                 
                 // 1. Sync VSCode extensions
@@ -759,6 +764,43 @@ namespace VSCodePortableLauncher
                     Console.WriteLine(messagePrefix + Path.GetFileName(installedDir));
                     Directory.Delete(installedDir, true);
                 }
+            }
+        }
+
+        static void NormalizeVSCodeSettingsFiles(string pvsDir)
+        {
+            NormalizeVSCodeSettingsFile(Path.Combine(pvsDir, "data", "user-data", "User", "settings.json"));
+            NormalizeVSCodeSettingsFile(Path.Combine(pvsDir, "data", "lib", "origin", "settings.json"));
+        }
+
+        static void NormalizeVSCodeSettingsFile(string settingsPath)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(settingsPath) || !File.Exists(settingsPath))
+                    return;
+
+                string content = File.ReadAllText(settingsPath);
+                string updated = Regex.Replace(
+                    content,
+                    "^\\s*\\\"python\\.defaultInterpreterPath\\\"\\s*:\\s*\\\"[^\\\"]*\\\",\\r?\\n",
+                    "",
+                    RegexOptions.Multiline);
+
+                if (!Regex.IsMatch(updated, "\\\"python\\.useEnvironmentsExtension\\\"\\s*:", RegexOptions.Multiline))
+                {
+                    updated = Regex.Replace(
+                        updated,
+                        "^(\\s*\\\"python\\.venvFolders\\\"\\s*:\\s*\\[[^\\]]*\\],\\r?\\n)",
+                        "$1  \\\"python.useEnvironmentsExtension\\\": true,\\r\\n",
+                        RegexOptions.Multiline);
+                }
+
+                if (!string.Equals(updated, content, StringComparison.Ordinal))
+                    File.WriteAllText(settingsPath, updated, Encoding.UTF8);
+            }
+            catch
+            {
             }
         }
 
