@@ -110,57 +110,102 @@ A typical installed layout looks like this:
 - Reinstalls fonts and recreates shortcuts
 - Cleans user-data and launches VS Code
 
-## Build
+## Terminal (PowerShell 7)
 
-Requirements:
+The integrated terminal runs **PowerShell 7** with a custom profile that provides a Unix-like experience on Windows. Type `?` at the prompt to list all available commands.
 
-- Windows
-- .NET Framework 4.7.2 build environment
-- `csc.exe`
+### Navigation
 
-Build command:
+| Command | Description |
+|---------|-------------|
+| `..` | Go up one directory |
+| `...` | Go up two directories |
+| `....` | Go up three directories |
+| `z <dir>` | Jump to a frequently visited directory (zoxide) |
+| `zi` | Interactively select a directory to jump to (zoxide + fzf) |
+| `<dirname>` | Change into a directory by typing its name directly |
+
+### File and Directory Listing
+
+| Command | Alias for | Description |
+|---------|-----------|-------------|
+| `ls` | `lsd` | Colorized directory listing with icons |
+| `ll` | `lsd -l` | Long format listing |
+| `la` | `lsd -lall` | Long format including hidden files |
+| `cat <file>` | `bat` | Syntax-highlighted file viewer with Git integration |
+| `find` | `fd` | Fast, user-friendly alternative to `find` |
+| `du` | `dust` | Disk usage with visual tree |
+| `df` | `duf` | Disk free space overview |
+
+### Text Processing
+
+| Command | Alias for | Description |
+|---------|-----------|-------------|
+| `grep <pattern>` | `rg` | Recursive regex search (ripgrep) |
+| `sed` | `sd` | Intuitive find-and-replace |
+| `jq` | — | Command-line JSON processor |
+| `delta` | — | Syntax-highlighted diff viewer |
+
+### System and Process Monitoring
+
+| Command | Alias for | Description |
+|---------|-----------|-------------|
+| `ps` | `procs` | Modern process list |
+| `top` | `btm` | Interactive graphical process/system monitor |
+| `ping <host>` | `gping` | Ping with a real-time graph |
+
+### Network
+
+| Command | Alias for | Description |
+|---------|-----------|-------------|
+| `http` | `xh` | Send HTTP requests (HTTPie-style) |
+| `dig <host>` | `dog` | DNS lookup |
+| `curlie` | — | curl with httpie-style output |
+
+### Miscellaneous Tools
+
+| Command | Description |
+|---------|-------------|
+| `fzf` | Interactive fuzzy finder |
+| `broot` | Interactive tree explorer and launcher |
+| `cheat <cmd>` | View community cheatsheets for a command |
+| `hyperfine <cmd>` | Command-line benchmarking |
+| `which <cmd>` | Show the full path of a command |
+| `clh` | Clear all terminal history (file, buffer, and session) |
+
+### Keyboard Shortcuts (PSReadLine / Emacs mode)
+
+| Key | Action |
+|-----|--------|
+| `Ctrl+A` | Move to beginning of line |
+| `Ctrl+E` | Move to end of line |
+| `Alt+B` | Move backward one word |
+| `Alt+F` | Move forward one word |
+| `Ctrl+U` | Delete to beginning of line |
+| `Ctrl+K` | Delete to end of line |
+| `Tab` | Menu-style autocomplete |
+| `Ctrl+R` | Fuzzy search command history (fzf) |
+| `Ctrl+T` | Fuzzy file picker (fzf) |
+| `↑` / `↓` | Navigate history predictions (inline list view) |
+
+### Running Python Scripts
+
+Python scripts can be run directly from the terminal without typing `python`:
 
 ```powershell
-./build
+foo.py          # runs: python foo.py
+./foo.py        # runs: python ./foo.py
+./ch1/foo.py    # runs: python ./ch1/foo.py
 ```
 
-Build outputs:
+If the first line of the script is exactly `#!replx`, it is executed with `replx` instead:
 
-- Intermediate artifact: `dist/launcher.exe`
-- Final artifact: `dist/devenv-setup.exe`
-
-`build.ps1` builds `launcher.exe` first, embeds it into `devenv-setup.exe`, and leaves only `devenv-setup.exe` as the final distribution artifact.
-
-## Git and Release Policy
-
-This repository does not commit build artifacts.
-
-- `dist/` is excluded from Git tracking
-- Only source code is pushed to GitHub
-- The final executable is distributed through GitHub Release assets only
-
-Release upload workflow for this repository:
+```python
+#!replx
+print("Hello from replx")
+```
 
 ```powershell
-./publish-release.ps1 -Tag v2026.04.17
+foo.py    # runs: replx foo.py
 ```
 
-Once at least one release already exists, you can upload to the latest release without specifying a tag:
-
-```powershell
-./publish-release.ps1
-```
-
-The script performs the following:
-
-- Verifies that `dist/devenv-setup.exe` exists
-- Queries the latest release when needed
-- Replaces the asset if the release already exists
-- Creates the first release and uploads the asset if no release exists yet
-
-## Implementation Notes
-
-- VS Code core installation uses direct archive extraction
-- VS Code extensions are downloaded as the latest VSIX packages in parallel and extracted directly
-- PowerShell 7 and VS Code download/extraction paths are kept as lightweight as possible
-- The upgrade UI keeps user-facing Key Events concise while preserving full diagnostic logs in files
