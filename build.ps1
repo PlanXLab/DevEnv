@@ -18,11 +18,13 @@ $commonSource = Join-Path $scriptDir "VSCodePortableCommon.cs"
 $launcherProgramSource = Join-Path $scriptDir "LauncherProgram.cs"
 $launcherFormSource = Join-Path $scriptDir "launcher.cs"
 $upgradeFormDesignerSource = Join-Path $scriptDir "UpgradeForm.Designer.cs"
+$launcherAssemblyInfoSource = Join-Path $scriptDir "Properties\AssemblyInfo.Launcher.cs"
 
 # Installer sources
 $installerProgramSource = Join-Path $scriptDir "Program.cs"
 $installerFormSource = Join-Path $scriptDir "installer.cs"
 $installFormDesignerSource = Join-Path $scriptDir "InstallForm.Designer.cs"
+$installerAssemblyInfoSource = Join-Path $scriptDir "Properties\AssemblyInfo.Installer.cs"
 
 # Find csc.exe
 $cscPaths = @(
@@ -209,7 +211,8 @@ $launcherArgs = @(
     $commonSource,
     $launcherProgramSource,
     $launcherFormSource,
-    $upgradeFormDesignerSource
+    $upgradeFormDesignerSource,
+    $launcherAssemblyInfoSource
 )
 
 if (Test-Path $iconFile) {
@@ -311,7 +314,8 @@ $installerArgs = @(
     $commonSource,
     $installerProgramSource,
     $installerFormSource,
-    $installFormDesignerSource
+    $installFormDesignerSource,
+    $installerAssemblyInfoSource
 )
 
 # Add icon

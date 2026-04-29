@@ -1,8 +1,8 @@
 using System.Reflection;
 using System.Runtime.InteropServices;
 
-[assembly: AssemblyTitle("VSCode Launcher")]
-[assembly: AssemblyProduct("VSCode Launcher")]
+[assembly: AssemblyTitle("DevEnv Setup")]
+[assembly: AssemblyProduct("DevEnv Setup")]
 [assembly: AssemblyCompany("PlanXLab")]
 [assembly: AssemblyCopyright("PlanXLab")]
 [assembly: AssemblyVersion("1.0.1.0")]
