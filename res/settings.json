@@ -63,8 +63,10 @@
   "python.defaultInterpreterPath": "${execPath}\\..\\data\\lib\\python\\python.exe",
   "python.terminal.activateEnvironment": false,
   "python.venvFolders": [],
-  "python.useEnvironmentsExtension": true,
+  "python.useEnvironmentsExtension": false,
   "python.createEnvironment.trigger": "off",
+  "python.experiments.optOutFrom": ["All"],
+  "python.locator": "native",
   "python.analysis.diagnosticSeverityOverrides": {
     "reportMissingModuleSource": "none"
   },
@@ -77,6 +79,7 @@
     "**/.git"
   ],
 
+  "extensions.ignoreRecommendations": true,
   "explorer.confirmDelete": false,
   "explorer.confirmPasteNative": false
 }

@@ -32,9 +32,14 @@ namespace VSCodePortableInstaller
         {
             "ms-python.vscode-python-envs"
         };
+        // Extensions that VS Code or other extensions may auto-install but we want removed
+        // - ms-python.debugpy: auto-installed by ms-python.python (we ship our own)
+        // - ms-python.vscode-python-envs: uses its own discovery, ignores defaultInterpreterPath,
+        //   shows uv install nag. Incompatible with our portable embedded Python.
         private static readonly string[] VSCODE_OPTIONAL_AUTO_INSTALLED_EXTENSIONS = new[]
         {
-            "ms-python.debugpy"
+            "ms-python.debugpy",
+            "ms-python.vscode-python-envs"
         };
         
         // URLs
@@ -1642,8 +1647,12 @@ namespace VSCodePortableInstaller
                     }
                     
                     // Check which critical components need retry (check both pvs.info AND disk)
+                    // Python: needs retry if python.exe OR pip.cmd is missing
+                    string pythonExeOnDisk = Path.Combine(installDir, "data", "lib", "python", "python.exe");
+                    string pipCmdOnDisk    = Path.Combine(installDir, "data", "lib", "python", "pip.cmd");
                     bool needVSCode = !allVersions.ContainsKey("VSCODE_VERSION") && !File.Exists(Path.Combine(installDir, "Code.exe"));
-                    bool needPython = !allVersions.ContainsKey("PYTHON_VERSION") && !File.Exists(Path.Combine(installDir, "data", "lib", "python", "python.exe"));
+                    bool needPython = !allVersions.ContainsKey("PYTHON_VERSION")
+                        && (!File.Exists(pythonExeOnDisk) || !File.Exists(pipCmdOnDisk));
                     
                     if (needVSCode)
                     {
@@ -1669,9 +1678,9 @@ namespace VSCodePortableInstaller
                     }
                     else if (!allVersions.ContainsKey("PYTHON_VERSION"))
                     {
-                        // python.exe exists on disk but version unknown - detect it
+                        // python.exe AND pip.cmd both exist on disk — base + pip already complete
                         allVersions["PYTHON_VERSION"] = "installed";
-                        LogActivity("Python: Already installed on disk, skipping re-install");
+                        LogActivity("Python: Already installed on disk (python.exe + pip.cmd), skipping re-install");
                         UpdateComponentStatus("Python", "✓ Completed", 100);
                     }
                     
@@ -2810,13 +2819,16 @@ namespace VSCodePortableInstaller
                 Directory.CreateDirectory(extensionsDir);
                 Directory.CreateDirectory(userDataDir);
 
+                // NOTE: ms-python.vscode-python-envs is intentionally excluded.
+                // It bypasses python.defaultInterpreterPath and shows uv install prompts.
+                // The legacy ms-python.python honors defaultInterpreterPath and works
+                // correctly with our embedded portable Python.
                 var extensions = new List<string>
                 {
                     "teabyii.ayu",
                     "zhuangtongfa.material-theme",
                     "ms-python.python",
                     "ms-python.vscode-pylance",
-                    "ms-python.vscode-python-envs",
                     "ms-vscode-remote.remote-ssh",
                     "KevinRose.vsc-python-indent",
                     "usernamehw.errorlens",

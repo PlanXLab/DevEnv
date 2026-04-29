@@ -53,7 +53,7 @@ Set-Alias -Name df -Value duf -Force
 Set-Alias -Name ping -Value gping -Force
 Set-Alias -Name http -Value xh -Force
 if (Get-Command zoxide -ErrorAction SilentlyContinue) {
-    Invoke-Expression (& zoxide init pwsh | Out-String)
+    Invoke-Expression (& zoxide init powershell | Out-String)
 }
 Set-Alias -Name sed -Value sd -Force
 
