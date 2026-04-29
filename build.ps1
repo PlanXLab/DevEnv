@@ -327,6 +327,8 @@ if (Test-Path $installerResx) {
 }
 
 # Add embedded resources
+# NOTE: res/*.sh files (devenv-setup.sh, launcher.sh) are macOS-only scripts
+# maintained for GitHub. They must NOT be embedded as resources.
 $installerArgs += "/resource:$profileTemplate,Microsoft.PowerShell_profile.ps1"
 $installerArgs += "/resource:$settingsTemplate,settings.json"
 
