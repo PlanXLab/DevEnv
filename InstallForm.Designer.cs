@@ -128,6 +128,7 @@ namespace VSCodePortableInstaller
             this.installPathTextBox.Name = "installPathTextBox";
             this.installPathTextBox.Size = new System.Drawing.Size(460, 23);
             this.installPathTextBox.Text = "C:\\VSCode";
+            this.installPathTextBox.TabIndex = 0;
             //
             // browseButton
             //
@@ -144,6 +145,7 @@ namespace VSCodePortableInstaller
             this.browseButton.Text = "Browse...";
             this.browseButton.UseVisualStyleBackColor = false;
             this.browseButton.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.browseButton.TabIndex = 1;
             this.browseButton.Click += new System.EventHandler(this.BrowseButton_Click);
             //
             // pythonLabel
@@ -163,6 +165,7 @@ namespace VSCodePortableInstaller
             this.pythonVersionTextBox.Location = new System.Drawing.Point(128, 46);
             this.pythonVersionTextBox.Name = "pythonVersionTextBox";
             this.pythonVersionTextBox.Size = new System.Drawing.Size(150, 23);
+            this.pythonVersionTextBox.TabIndex = 2;
             //
             // pythonHint
             //
@@ -199,6 +202,7 @@ namespace VSCodePortableInstaller
             this.installButton.Text = "Install";
             this.installButton.UseVisualStyleBackColor = false;
             this.installButton.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.installButton.TabIndex = 3;
             this.installButton.Click += new System.EventHandler(this.InstallButton_Click);
             //
             // cancelButton
@@ -216,6 +220,7 @@ namespace VSCodePortableInstaller
             this.cancelButton.Text = "Cancel";
             this.cancelButton.UseVisualStyleBackColor = false;
             this.cancelButton.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.cancelButton.TabIndex = 4;
             this.cancelButton.Click += new System.EventHandler(this.CancelButton_Click);
             //
             // separatorPanel
