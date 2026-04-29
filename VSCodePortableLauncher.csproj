@@ -49,6 +49,7 @@
     <Reference Include="Microsoft.CSharp" />
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="Properties\AssemblyInfo.Launcher.cs" />
     <Compile Include="LauncherProgram.cs" />
     <Compile Include="launcher.cs">
       <SubType>Form</SubType>

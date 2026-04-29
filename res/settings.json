@@ -2,25 +2,28 @@
   "files.autoSave": "onFocusChange",
   "files.autoSaveDelay": 500,
   "files.exclude": {
-    "**/largeFolder": true,
     "**/__pycache__": true,
     "**/.venv": true,
     "**/.vscode": true,
     "**/.temp": true,
-    "**/.git": true,
+    "**/.git": true
   },
   "files.watcherExclude": {
-    ".git/objects": true,
-    ".git/subtree-cache": true,
-    "dist": true,
-    "build": true,
-    ".vscode": true,
-    ".cache": true,
-    "__pycache__": true,
+    "**/.git/objects/**": true,
+    "**/.git/subtree-cache/**": true,
+    "**/dist/**": true,
+    "**/build/**": true,
+    "**/.vscode/**": true,
+    "**/.cache/**": true,
+    "**/__pycache__/**": true,
+    "**/.venv/**": true
   },
   "search.exclude": {
-    "dist": true,
-    "build": true,
+    "**/dist/**": true,
+    "**/build/**": true,
+    "**/__pycache__/**": true,
+    "**/.venv/**": true,
+    "**/.git/**": true
   },
   "editor.mouseWheelZoom": true,
   "editor.fontFamily": "'0xProto Nerd Font', DalseoHealing",
@@ -57,12 +60,13 @@
     }
   },
 
+  "python.defaultInterpreterPath": "${execPath}\\..\\data\\lib\\python\\python.exe",
   "python.terminal.activateEnvironment": false,
   "python.venvFolders": [],
   "python.useEnvironmentsExtension": true,
   "python.createEnvironment.trigger": "off",
   "python.analysis.diagnosticSeverityOverrides": {
-      "reportMissingModuleSource": "none"
+    "reportMissingModuleSource": "none"
   },
   "python.analysis.exclude": [
     "**/__pycache__",
@@ -70,10 +74,9 @@
     "**/.vscode",
     "**/build",
     "**/dist",
-    "**/.git",
-    "**/largeFolder"
+    "**/.git"
   ],
 
   "explorer.confirmDelete": false,
-  "explorer.confirmPasteNative": false,
+  "explorer.confirmPasteNative": false
 }

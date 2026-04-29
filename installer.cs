@@ -30,7 +30,6 @@ namespace VSCodePortableInstaller
         private const int MAX_ACTIVITY_LOG_LINES = 20;
         private static readonly string[] VSCODE_PLATFORM_SENSITIVE_EXTENSIONS = new[]
         {
-            "ms-python.python",
             "ms-python.vscode-python-envs"
         };
         private static readonly string[] VSCODE_OPTIONAL_AUTO_INSTALLED_EXTENSIONS = new[]
@@ -44,6 +43,8 @@ namespace VSCodePortableInstaller
         private const string BOOTSTRAP_PIP_URL = "https://bootstrap.pypa.io/get-pip.py";
         private const string VSCODE_LATEST_DOWNLOAD_URL = "https://update.code.visualstudio.com/latest/win32-x64-archive/stable";
         private const string VSCODE_MARKETPLACE_VSIX_URL_TEMPLATE = "https://marketplace.visualstudio.com/_apis/public/gallery/publishers/{0}/vsextensions/{1}/latest/vspackage";
+        private const string VSCODE_MARKETPLACE_VSIX_VERSION_URL_TEMPLATE = "https://marketplace.visualstudio.com/_apis/public/gallery/publishers/{0}/vsextensions/{1}/{2}/vspackage";
+        private const string VSCODE_MARKETPLACE_QUERY_URL = "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery";
         
         // Paths
         private const string TEMP_INSTALL_DIR = "vscode-pvs-install";
@@ -2301,8 +2302,10 @@ namespace VSCodePortableInstaller
                 string pthFile = Path.Combine(pythonDir, "python" + shortVer + "._pth");
                 if (File.Exists(pthFile))
                 {
-                    string newPthFile = Path.Combine(pythonDir, "__python" + shortVer + "._pth");
-                    File.Move(pthFile, newPthFile);
+                    string pthContent = File.ReadAllText(pthFile, Encoding.UTF8);
+                    string newContent = Regex.Replace(pthContent, @"^#\s*import\s+site\b", "import site", RegexOptions.Multiline | RegexOptions.IgnoreCase);
+                    if (!string.Equals(newContent, pthContent, StringComparison.Ordinal))
+                        File.WriteAllText(pthFile, newContent, Encoding.UTF8);
                 }
 
                 string pythonExe = Path.Combine(pythonDir, "python.exe");
@@ -2918,7 +2921,66 @@ namespace VSCodePortableInstaller
                     }
                     else
                     {
-                        LogActivity("VSCode: " + failedExtensions.Count + " extension(s) failed direct extraction and CLI fallback is unavailable");
+                        // CLI not available: re-download and retry direct extraction
+                        LogActivity("VSCode: CLI unavailable -- re-downloading " + failedExtensions.Count + " failed extension(s) for retry...");
+                        await Task.Delay(2000);
+
+                        var stillFailed = new List<string>();
+                        foreach (var ext in failedExtensions)
+                        {
+                            bool success = false;
+                            try
+                            {
+                                        string vsixPath = Path.Combine(tempVsixDir, ext.Replace('.', '_') + "_retry.vsix");
+                                    var retryHandler = new HttpClientHandler
+                                    {
+                                        AutomaticDecompression = System.Net.DecompressionMethods.GZip | System.Net.DecompressionMethods.Deflate
+                                    };
+                                    using (var retryClient = new HttpClient(retryHandler))
+                                    {
+                                        retryClient.Timeout = TimeSpan.FromMinutes(MAX_DOWNLOAD_TIMEOUT_MINUTES);
+                                        retryClient.DefaultRequestHeaders.Add("User-Agent", "VSCode-Portable-Installer");
+                                        string packageUrl = await BuildVSCodeMarketplaceVsixUrlAsync(retryClient, ext);
+                                        if (!string.IsNullOrEmpty(packageUrl))
+                                        {
+                                            using (var response = await retryClient.GetAsync(packageUrl, HttpCompletionOption.ResponseHeadersRead))
+                                            {
+                                                response.EnsureSuccessStatusCode();
+                                                using (var contentStream = await response.Content.ReadAsStreamAsync())
+                                                using (var fileStream = new FileStream(vsixPath, FileMode.Create, FileAccess.Write, FileShare.None, DOWNLOAD_BUFFER_SIZE, true))
+                                                {
+                                                    await contentStream.CopyToAsync(fileStream);
+                                                }
+                                            }
+                                            if (File.Exists(vsixPath) && new FileInfo(vsixPath).Length > 0 && IsValidZipArchive(vsixPath))
+                                            {
+                                                success = TryExtractVSCodeExtensionPackage(vsixPath, extensionsDir, ext);
+                                                if (!success)
+                                                    success = IsVSCodeExtensionInstalled(extensionsDir, ext);
+                                            }
+                                        }
+                                    }
+                            }
+                            catch (Exception ex)
+                            {
+                                LogActivity("VSCode: Re-download retry failed for " + ext + " -- " + ex.Message);
+                            }
+                            if (success)
+                                LogActivity("VSCode: Re-download retry -- " + ext + " OK");
+                            else
+                                stillFailed.Add(ext);
+                            await Task.Delay(300);
+                        }
+
+                        if (stillFailed.Count > 0)
+                        {
+                            LogActivity("VSCode: " + stillFailed.Count + " extension(s) could not be installed: " + string.Join(", ", stillFailed));
+                            LogActivity("VSCode: These can be installed manually from within VS Code");
+                        }
+                        else
+                        {
+                            LogActivity("VSCode: All previously failed extensions recovered successfully");
+                        }
                     }
                 }
 
@@ -3192,7 +3254,7 @@ namespace VSCodePortableInstaller
                     await semaphore.WaitAsync();
                     try
                     {
-                        string packageUrl = BuildVSCodeMarketplaceVsixUrl(ext);
+                        string packageUrl = await BuildVSCodeMarketplaceVsixUrlAsync(client, ext);
                         if (string.IsNullOrEmpty(packageUrl))
                         {
                             LogActivity("VSCode: VSIX URL build failed -- " + ext);
@@ -3272,6 +3334,94 @@ namespace VSCodePortableInstaller
             }
         }
 
+        private async Task<string> BuildVSCodeMarketplaceVsixUrlAsync(HttpClient client, string extensionId)
+        {
+            if (string.IsNullOrEmpty(extensionId))
+                return "";
+
+            int separatorIndex = extensionId.IndexOf('.');
+            if (separatorIndex <= 0 || separatorIndex >= extensionId.Length - 1)
+                return "";
+
+            string publisher = extensionId.Substring(0, separatorIndex);
+            string extensionName = extensionId.Substring(separatorIndex + 1);
+
+            try
+            {
+                string stableVersion = await QueryLatestStableExtensionVersion(client, publisher, extensionName);
+                if (!string.IsNullOrEmpty(stableVersion))
+                {
+                    string versionUrl = string.Format(VSCODE_MARKETPLACE_VSIX_VERSION_URL_TEMPLATE, publisher, extensionName, stableVersion);
+                    if (ShouldRetryVSCodeExtensionById(extensionId))
+                        versionUrl += "?targetPlatform=win32-x64";
+                    return versionUrl;
+                }
+            }
+            catch (Exception ex)
+            {
+                LogActivity("VSCode: Stable version query failed for " + extensionId + " -- " + ex.Message);
+            }
+
+            // Fallback to latest URL
+            string fallbackUrl = string.Format(VSCODE_MARKETPLACE_VSIX_URL_TEMPLATE, publisher, extensionName);
+            if (ShouldRetryVSCodeExtensionById(extensionId))
+                fallbackUrl += "?targetPlatform=win32-x64";
+            return fallbackUrl;
+        }
+
+        private async Task<string> QueryLatestStableExtensionVersion(HttpClient client, string publisher, string name)
+        {
+            string body = "{\"filters\":[{\"criteria\":[{\"filterType\":7,\"value\":\"" + publisher + "." + name + "\"}],\"pageNumber\":1,\"pageSize\":1,\"sortBy\":0,\"sortOrder\":0}],\"assetTypes\":[],\"flags\":17}";
+            using (var request = new HttpRequestMessage(HttpMethod.Post, VSCODE_MARKETPLACE_QUERY_URL))
+            {
+                request.Content = new StringContent(body, Encoding.UTF8, "application/json");
+                request.Headers.TryAddWithoutValidation("Accept", "application/json;api-version=3.0-preview.1");
+                using (var response = await client.SendAsync(request))
+                {
+                    response.EnsureSuccessStatusCode();
+                    string json = await response.Content.ReadAsStringAsync();
+                    return FindLatestStableVersion(json);
+                }
+            }
+        }
+
+        private string FindLatestStableVersion(string json)
+        {
+            int versionsIdx = json.IndexOf("\"versions\"", StringComparison.Ordinal);
+            if (versionsIdx < 0) return null;
+
+            int arrayStart = json.IndexOf('[', versionsIdx);
+            if (arrayStart < 0) return null;
+
+            int pos = arrayStart + 1;
+            while (pos < json.Length)
+            {
+                while (pos < json.Length && json[pos] != '{' && json[pos] != ']') pos++;
+                if (pos >= json.Length || json[pos] == ']') break;
+
+                int objStart = pos, depth = 0, objEnd = pos;
+                while (objEnd < json.Length)
+                {
+                    if (json[objEnd] == '{') depth++;
+                    else if (json[objEnd] == '}') { depth--; if (depth == 0) { objEnd++; break; } }
+                    objEnd++;
+                }
+
+                string obj = json.Substring(objStart, objEnd - objStart);
+                var versionMatch = Regex.Match(obj, "\"version\"\\s*:\\s*\"([^\"]+)\"");
+                if (versionMatch.Success)
+                {
+                    bool isPreRelease = obj.IndexOf("Microsoft.VisualStudio.Code.PreRelease", StringComparison.Ordinal) >= 0
+                        && Regex.IsMatch(obj, "\"value\"\\s*:\\s*\"true\"", RegexOptions.IgnoreCase);
+                    if (!isPreRelease)
+                        return versionMatch.Groups[1].Value;
+                }
+
+                pos = objEnd;
+            }
+            return null;
+        }
+
         private string BuildVSCodeMarketplaceVsixUrl(string extensionId)
         {
             if (string.IsNullOrEmpty(extensionId))
@@ -3283,7 +3433,10 @@ namespace VSCodePortableInstaller
 
             string publisher = extensionId.Substring(0, separatorIndex);
             string extensionName = extensionId.Substring(separatorIndex + 1);
-            return string.Format(VSCODE_MARKETPLACE_VSIX_URL_TEMPLATE, publisher, extensionName);
+            string url = string.Format(VSCODE_MARKETPLACE_VSIX_URL_TEMPLATE, publisher, extensionName);
+            if (ShouldRetryVSCodeExtensionById(extensionId))
+                url += "?targetPlatform=win32-x64";
+            return url;
         }
 
         private bool IsVSCodeExtensionInstalled(string extensionsDir, string extensionId)

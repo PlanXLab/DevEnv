@@ -16,7 +16,6 @@ namespace VSCodePortableLauncher
     {
         static readonly string[] PlatformSensitiveVSCodeExtensions = new[]
         {
-            "ms-python.python",
             "ms-python.vscode-python-envs"
         };
 
