@@ -30,6 +30,11 @@ namespace VSCodePortableInstaller
         private const int MAX_ACTIVITY_LOG_LINES = 20;
         private static readonly string[] VSCODE_PLATFORM_SENSITIVE_EXTENSIONS = new[]
         {
+            // ms-python.python ships a platform-specific 'pet.exe' (Python Env Tool)
+            // under python-env-tools/bin/. Without targetPlatform=win32-x64, the
+            // marketplace returns the platform-neutral package which contains only
+            // the Linux 'pet' binary, causing 'Python Locator failed to start'.
+            "ms-python.python",
             "ms-python.vscode-python-envs"
         };
         // Extensions that VS Code or other extensions may auto-install but we want removed
@@ -2311,10 +2316,17 @@ namespace VSCodePortableInstaller
                 string pthFile = Path.Combine(pythonDir, "python" + shortVer + "._pth");
                 if (File.Exists(pthFile))
                 {
+                    // Read as UTF-8 (auto-detects and strips BOM if present)
                     string pthContent = File.ReadAllText(pthFile, Encoding.UTF8);
+                    // Defensive: strip any leftover BOM character before regex
+                    if (pthContent.Length > 0 && pthContent[0] == '\uFEFF')
+                        pthContent = pthContent.Substring(1);
                     string newContent = Regex.Replace(pthContent, @"^#\s*import\s+site\b", "import site", RegexOptions.Multiline | RegexOptions.IgnoreCase);
-                    if (!string.Equals(newContent, pthContent, StringComparison.Ordinal))
-                        File.WriteAllText(pthFile, newContent, Encoding.UTF8);
+                    // CRITICAL: Python embedded ._pth parser does NOT strip BOM.
+                    // A BOM on the first line corrupts the python<ver>.zip path,
+                    // breaking 'encodings' module discovery and aborting Python init.
+                    // Always rewrite without BOM to guarantee correctness.
+                    File.WriteAllText(pthFile, newContent, new UTF8Encoding(false));
                 }
 
                 string pythonExe = Path.Combine(pythonDir, "python.exe");
@@ -2510,7 +2522,7 @@ namespace VSCodePortableInstaller
                 client.Timeout = TimeSpan.FromMinutes(MAX_DOWNLOAD_TIMEOUT_MINUTES);
                 client.DefaultRequestHeaders.ConnectionClose = false;
                 var getPipContent = await client.GetStringAsync(BOOTSTRAP_PIP_URL);
-                File.WriteAllText(getPipPath, getPipContent, Encoding.UTF8);
+                File.WriteAllText(getPipPath, getPipContent, new UTF8Encoding(false));
             }
 
             if (!File.Exists(getPipPath))
@@ -2949,19 +2961,21 @@ namespace VSCodePortableInstaller
                                         AutomaticDecompression = System.Net.DecompressionMethods.GZip | System.Net.DecompressionMethods.Deflate
                                     };
                                     using (var retryClient = new HttpClient(retryHandler))
+                                    using (var retryCts = new System.Threading.CancellationTokenSource(TimeSpan.FromSeconds(120)))
                                     {
                                         retryClient.Timeout = TimeSpan.FromMinutes(MAX_DOWNLOAD_TIMEOUT_MINUTES);
                                         retryClient.DefaultRequestHeaders.Add("User-Agent", "VSCode-Portable-Installer");
-                                        string packageUrl = await BuildVSCodeMarketplaceVsixUrlAsync(retryClient, ext);
+                                        var retryToken = retryCts.Token;
+                                        string packageUrl = await BuildVSCodeMarketplaceVsixUrlAsync(retryClient, ext, retryToken);
                                         if (!string.IsNullOrEmpty(packageUrl))
                                         {
-                                            using (var response = await retryClient.GetAsync(packageUrl, HttpCompletionOption.ResponseHeadersRead))
+                                            using (var response = await retryClient.GetAsync(packageUrl, HttpCompletionOption.ResponseHeadersRead, retryToken))
                                             {
                                                 response.EnsureSuccessStatusCode();
                                                 using (var contentStream = await response.Content.ReadAsStreamAsync())
                                                 using (var fileStream = new FileStream(vsixPath, FileMode.Create, FileAccess.Write, FileShare.None, DOWNLOAD_BUFFER_SIZE, true))
                                                 {
-                                                    await contentStream.CopyToAsync(fileStream);
+                                                    await contentStream.CopyToAsync(fileStream, DOWNLOAD_BUFFER_SIZE, retryToken);
                                                 }
                                             }
                                             if (File.Exists(vsixPath) && new FileInfo(vsixPath).Length > 0 && IsValidZipArchive(vsixPath))
@@ -2972,6 +2986,10 @@ namespace VSCodePortableInstaller
                                             }
                                         }
                                     }
+                            }
+                            catch (OperationCanceledException)
+                            {
+                                LogActivity("VSCode: Re-download retry timeout (120s) for " + ext);
                             }
                             catch (Exception ex)
                             {
@@ -3264,63 +3282,73 @@ namespace VSCodePortableInstaller
                 var downloadTasks = extensions.Select(async ext =>
                 {
                     await semaphore.WaitAsync();
-                    try
+                    // Per-extension hard timeout. HttpClient.Timeout only covers headers;
+                    // a stalled CDN stream during CopyToAsync would otherwise hang forever.
+                    using (var perExtCts = new System.Threading.CancellationTokenSource(TimeSpan.FromSeconds(45)))
                     {
-                        string packageUrl = await BuildVSCodeMarketplaceVsixUrlAsync(client, ext);
-                        if (string.IsNullOrEmpty(packageUrl))
+                        var perExtToken = perExtCts.Token;
+                        try
                         {
-                            LogActivity("VSCode: VSIX URL build failed -- " + ext);
-                            return;
-                        }
-
-                        string vsixPath = Path.Combine(tempVsixDir, ext.Replace('.', '_') + ".vsix");
-                        LogActivity("VSCode: Downloading VSIX -- " + ext);
-
-                        using (var response = await client.GetAsync(packageUrl, HttpCompletionOption.ResponseHeadersRead))
-                        {
-                            response.EnsureSuccessStatusCode();
-                            using (var contentStream = await response.Content.ReadAsStreamAsync())
-                            using (var fileStream = new FileStream(vsixPath, FileMode.Create, FileAccess.Write, FileShare.None, DOWNLOAD_BUFFER_SIZE, true))
+                            string packageUrl = await BuildVSCodeMarketplaceVsixUrlAsync(client, ext, perExtToken);
+                            if (string.IsNullOrEmpty(packageUrl))
                             {
-                                await contentStream.CopyToAsync(fileStream);
+                                LogActivity("VSCode: VSIX URL build failed -- " + ext);
+                                return;
                             }
-                        }
 
-                        if (File.Exists(vsixPath) && new FileInfo(vsixPath).Length > 0)
-                        {
-                            if (IsValidZipArchive(vsixPath))
+                            string vsixPath = Path.Combine(tempVsixDir, ext.Replace('.', '_') + ".vsix");
+                            LogActivity("VSCode: Downloading VSIX -- " + ext);
+
+                            using (var response = await client.GetAsync(packageUrl, HttpCompletionOption.ResponseHeadersRead, perExtToken))
                             {
-                                lock (resultLock)
+                                response.EnsureSuccessStatusCode();
+                                using (var contentStream = await response.Content.ReadAsStreamAsync())
+                                using (var fileStream = new FileStream(vsixPath, FileMode.Create, FileAccess.Write, FileShare.None, DOWNLOAD_BUFFER_SIZE, true))
                                 {
-                                    results[ext] = vsixPath;
+                                    await contentStream.CopyToAsync(fileStream, DOWNLOAD_BUFFER_SIZE, perExtToken);
+                                }
+                            }
+
+                            if (File.Exists(vsixPath) && new FileInfo(vsixPath).Length > 0)
+                            {
+                                if (IsValidZipArchive(vsixPath))
+                                {
+                                    lock (resultLock)
+                                    {
+                                        results[ext] = vsixPath;
+                                    }
+                                }
+                                else
+                                {
+                                    LogActivity("VSCode: VSIX validation failed -- " + ext + " -- downloaded file is not a valid zip archive");
                                 }
                             }
                             else
                             {
-                                LogActivity("VSCode: VSIX validation failed -- " + ext + " -- downloaded file is not a valid zip archive");
+                                LogActivity("VSCode: VSIX download produced empty file -- " + ext);
                             }
                         }
-                        else
+                        catch (OperationCanceledException)
                         {
-                            LogActivity("VSCode: VSIX download produced empty file -- " + ext);
+                            LogActivity("VSCode: VSIX download timeout (45s) -- " + ext + " -- will retry later");
                         }
-                    }
-                    catch (Exception ex)
-                    {
-                        LogActivity("VSCode: VSIX download failed -- " + ext + " -- " + ex.Message);
-                    }
-                    finally
-                    {
-                        int currentCompleted;
-                        lock (resultLock)
+                        catch (Exception ex)
                         {
-                            completed++;
-                            currentCompleted = completed;
+                            LogActivity("VSCode: VSIX download failed -- " + ext + " -- " + ex.Message);
                         }
+                        finally
+                        {
+                            int currentCompleted;
+                            lock (resultLock)
+                            {
+                                completed++;
+                                currentCompleted = completed;
+                            }
 
-                        int progress = 82 + (int)(4.0 * currentCompleted / total);
-                        UpdateComponentStatus(componentName, "Downloading extensions (" + currentCompleted + "/" + total + ")...", progress);
-                        semaphore.Release();
+                            int progress = 82 + (int)(4.0 * currentCompleted / total);
+                            UpdateComponentStatus(componentName, "Downloading extensions (" + currentCompleted + "/" + total + ")...", progress);
+                            semaphore.Release();
+                        }
                     }
                 }).ToArray();
 
@@ -3346,7 +3374,7 @@ namespace VSCodePortableInstaller
             }
         }
 
-        private async Task<string> BuildVSCodeMarketplaceVsixUrlAsync(HttpClient client, string extensionId)
+        private async Task<string> BuildVSCodeMarketplaceVsixUrlAsync(HttpClient client, string extensionId, System.Threading.CancellationToken cancellationToken)
         {
             if (string.IsNullOrEmpty(extensionId))
                 return "";
@@ -3360,7 +3388,7 @@ namespace VSCodePortableInstaller
 
             try
             {
-                string stableVersion = await QueryLatestStableExtensionVersion(client, publisher, extensionName);
+                string stableVersion = await QueryLatestStableExtensionVersion(client, publisher, extensionName, cancellationToken);
                 if (!string.IsNullOrEmpty(stableVersion))
                 {
                     string versionUrl = string.Format(VSCODE_MARKETPLACE_VSIX_VERSION_URL_TEMPLATE, publisher, extensionName, stableVersion);
@@ -3381,14 +3409,14 @@ namespace VSCodePortableInstaller
             return fallbackUrl;
         }
 
-        private async Task<string> QueryLatestStableExtensionVersion(HttpClient client, string publisher, string name)
+        private async Task<string> QueryLatestStableExtensionVersion(HttpClient client, string publisher, string name, System.Threading.CancellationToken cancellationToken)
         {
             string body = "{\"filters\":[{\"criteria\":[{\"filterType\":7,\"value\":\"" + publisher + "." + name + "\"}],\"pageNumber\":1,\"pageSize\":1,\"sortBy\":0,\"sortOrder\":0}],\"assetTypes\":[],\"flags\":17}";
             using (var request = new HttpRequestMessage(HttpMethod.Post, VSCODE_MARKETPLACE_QUERY_URL))
             {
                 request.Content = new StringContent(body, Encoding.UTF8, "application/json");
                 request.Headers.TryAddWithoutValidation("Accept", "application/json;api-version=3.0-preview.1");
-                using (var response = await client.SendAsync(request))
+                using (var response = await client.SendAsync(request, cancellationToken))
                 {
                     response.EnsureSuccessStatusCode();
                     string json = await response.Content.ReadAsStringAsync();
